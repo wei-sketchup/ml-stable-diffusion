@@ -5,7 +5,6 @@ import XCTest
 import CoreML
 @testable import StableDiffusion
 
-@available(iOS 16.2, macOS 13.1, *)
 final class StableDiffusionTests: XCTestCase {
 
     var vocabFileInBundleURL: URL {

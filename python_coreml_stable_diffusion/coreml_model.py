@@ -16,28 +16,13 @@ import numpy as np
 
 import os
 import time
-import subprocess
-import sys
-
-
-def _macos_version():
-    """
-    Returns macOS version as a tuple of integers. On non-Macs, returns an empty tuple.
-    """
-    if sys.platform == "darwin":
-        try:
-            ver_str = subprocess.run(["sw_vers", "-productVersion"], stdout=subprocess.PIPE).stdout.decode('utf-8').strip('\n')
-            return tuple([int(v) for v in ver_str.split(".")])
-        except:
-            raise Exception("Unable to determine the macOS version")
-    return ()
 
 
 class CoreMLModel:
     """ Wrapper for running CoreML models using coremltools
     """
 
-    def __init__(self, model_path, compute_unit, sources='packages', optimization_hints=None):
+    def __init__(self, model_path, compute_unit, sources='packages'):
 
         logger.info(f"Loading {model_path}")
 
@@ -46,10 +31,7 @@ class CoreMLModel:
             assert os.path.exists(model_path) and model_path.endswith(".mlpackage")
 
             self.model = ct.models.MLModel(
-                model_path,
-                compute_units=ct.ComputeUnit[compute_unit],
-                optimization_hints=optimization_hints,
-            )
+                model_path, compute_units=ct.ComputeUnit[compute_unit])
             DTYPE_MAP = {
                 65552: np.float16,
                 65568: np.float32,
@@ -65,11 +47,7 @@ class CoreMLModel:
         elif sources == 'compiled':
             assert os.path.exists(model_path) and model_path.endswith(".mlmodelc")
 
-            self.model = ct.models.CompiledMLModel(
-                model_path,
-                compute_units=ct.ComputeUnit[compute_unit],
-                optimization_hints=optimization_hints,
-            )
+            self.model = ct.models.CompiledMLModel(model_path, ct.ComputeUnit[compute_unit])
 
             # Grab expected inputs from metadata.json
             with open(os.path.join(model_path, 'metadata.json'), 'r') as f:
@@ -192,15 +170,7 @@ def _load_mlpackage(submodule_name,
             raise FileNotFoundError(
                 f"{submodule_name} CoreML model doesn't exist at {mlpackage_path}")
 
-    # On macOS 15+, set fast prediction optimization hint for the unet.
-    optimization_hints = None
-    if submodule_name == "unet" and _macos_version() >= (15, 0):
-        optimization_hints = {"specializationStrategy": ct.SpecializationStrategy.FastPrediction}
-
-    return CoreMLModel(mlpackage_path,
-                       compute_unit,
-                       sources=sources,
-                       optimization_hints=optimization_hints)
+    return CoreMLModel(mlpackage_path, compute_unit, sources=sources)
 
 
 def _load_mlpackage_controlnet(mlpackages_dir, model_version, compute_unit):

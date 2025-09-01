@@ -13,8 +13,6 @@ public enum StableDiffusionScheduler {
     case pndmScheduler
     /// Scheduler that uses a second order DPM-Solver++ algorithm
     case dpmSolverMultistepScheduler
-    /// Scheduler for rectified flow based multimodal diffusion transformer models
-    case discreteFlowScheduler
 }
 
 /// RNG compatible with StableDiffusionPipeline
@@ -25,6 +23,8 @@ public enum StableDiffusionRNG {
     case torchRNG
     /// RNG that matches PyTorch CUDA implementation.
     case nvidiaRNG
+    /// Use MLTensor.
+    case coreml
 }
 
 public enum PipelineError: String, Swift.Error {
@@ -32,25 +32,22 @@ public enum PipelineError: String, Swift.Error {
     case startingImageProvidedWithoutEncoder
     case startingText2ImgWithoutTextEncoder
     case unsupportedOSVersion
-    case errorCreatingPreview
 }
 
-@available(iOS 16.2, macOS 13.1, *)
 public protocol StableDiffusionPipelineProtocol: ResourceManaging {
     var canSafetyCheck: Bool { get }
 
     func generateImages(
         configuration config: PipelineConfiguration,
         progressHandler: (PipelineProgress) -> Bool
-    ) throws -> [CGImage?]
+    ) async throws -> [CGImage?]
 
     func decodeToImages(
-        _ latents: [MLShapedArray<Float32>],
+        _ latents: [MLTensor],
         configuration config: PipelineConfiguration
-    ) throws -> [CGImage?]
+    ) async throws -> [CGImage?]
 }
 
-@available(iOS 16.2, macOS 13.1, *)
 public extension StableDiffusionPipelineProtocol {
     var canSafetyCheck: Bool { false }
 }
@@ -59,9 +56,7 @@ public extension StableDiffusionPipelineProtocol {
 ///
 /// This implementation matches:
 /// [Hugging Face Diffusers Pipeline](https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py)
-@available(iOS 16.2, macOS 13.1, *)
 public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
-
     /// Model to generate embeddings for tokenized input text
     var textEncoder: TextEncoderModel
 
@@ -70,13 +65,13 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
 
     /// Model used to generate final image from latent diffusion process
     var decoder: Decoder
-    
+
     /// Model used to latent space for image2image, and soon, in-painting
     var encoder: Encoder?
 
     /// Optional model for checking safety of generated image
     var safetyChecker: SafetyChecker? = nil
-    
+
     /// Optional model used before Unet to control generated images by additonal inputs
     var controlNet: ControlNet? = nil
 
@@ -139,7 +134,6 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
     ///   - useMultilingualTextEncoder: Option to use system multilingual NLContextualEmbedding as encoder
     ///   - script: Optional natural language script to use for the text encoder.
     /// - Returns: Pipeline ready for image generation
-    @available(iOS 17.0, macOS 14.0, *)
     public init(
         textEncoder: TextEncoderModel,
         unet: Unet,
@@ -166,37 +160,46 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
     ///
     /// If reducedMemory is true this will instead call prewarmResources instead
     /// and let the pipeline lazily load resources as needed
-    public func loadResources() throws {
+    public func loadResources() async throws {
         if reduceMemory {
-            try prewarmResources()
+            try await prewarmResources()
         } else {
-            try unet.loadResources()
-            try textEncoder.loadResources()
-            try decoder.loadResources()
-            try encoder?.loadResources()
-            try controlNet?.loadResources()
-            try safetyChecker?.loadResources()
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask { try await unet.loadResources() }
+                group.addTask { try await textEncoder.loadResources() }
+                group.addTask { try await decoder.loadResources() }
+                group.addTask { try await encoder?.loadResources() }
+                group.addTask { try await controlNet?.loadResources() }
+                group.addTask { try await safetyChecker?.loadResources() }
+                try await group.waitForAll()
+            }
         }
     }
 
     /// Unload the underlying resources to free up memory
-    public func unloadResources() {
-        textEncoder.unloadResources()
-        unet.unloadResources()
-        decoder.unloadResources()
-        encoder?.unloadResources()
-        controlNet?.unloadResources()
-        safetyChecker?.unloadResources()
+    public func unloadResources() async {
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { await unet.unloadResources() }
+            group.addTask { await textEncoder.unloadResources() }
+            group.addTask { await decoder.unloadResources() }
+            group.addTask { await encoder?.unloadResources() }
+            group.addTask { await controlNet?.unloadResources() }
+            group.addTask { await safetyChecker?.unloadResources() }
+            await group.waitForAll()
+        }
     }
 
     // Prewarm resources one at a time
-    public func prewarmResources() throws {
-        try textEncoder.prewarmResources()
-        try unet.prewarmResources()
-        try decoder.prewarmResources()
-        try encoder?.prewarmResources()
-        try controlNet?.prewarmResources()
-        try safetyChecker?.prewarmResources()
+    public func prewarmResources() async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { try await unet.prewarmResources() }
+            group.addTask { try await textEncoder.prewarmResources() }
+            group.addTask { try await decoder.prewarmResources() }
+            group.addTask { try await encoder?.prewarmResources() }
+            group.addTask { try await controlNet?.prewarmResources() }
+            group.addTask { try await safetyChecker?.prewarmResources() }
+            try await group.waitForAll()
+        }
     }
 
     /// Image generation using stable diffusion
@@ -208,131 +211,104 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
     public func generateImages(
         configuration config: Configuration,
         progressHandler: (Progress) -> Bool = { _ in true }
-    ) throws -> [CGImage?] {
-
-        // Encode the input prompt
-        var promptEmbedding = try textEncoder.encode(config.prompt)
-
-        if config.guidanceScale >= 1.0 {
-            // Convert to Unet hidden state representation
-            // Concatenate the prompt and negative prompt embeddings
-            let negativePromptEmbedding = try textEncoder.encode(config.negativePrompt)
-            promptEmbedding = MLShapedArray<Float32>(
-                concatenating: [negativePromptEmbedding, promptEmbedding],
-                alongAxis: 0
-            )
-        }
+    ) async throws -> [CGImage?] {
+        // Encode the input prompt and negative prompt
+        let promptEmbedding = try await textEncoder.encode(config.prompt)
+        let negativePromptEmbedding = try await textEncoder.encode(config.negativePrompt)
 
         if reduceMemory {
-            textEncoder.unloadResources()
+            await textEncoder.unloadResources()
         }
 
-        let hiddenStates = useMultilingualTextEncoder ? promptEmbedding : toHiddenStates(promptEmbedding)
+        // Convert to Unet hidden state representation
+        // Concatenate the prompt and negative prompt embeddings
+        let concatEmbedding = MLTensor(
+            concatenating: [negativePromptEmbedding, promptEmbedding],
+            alongAxis: 0
+        )
+
+        let hiddenStates = useMultilingualTextEncoder ? concatEmbedding : toHiddenStates(concatEmbedding)
 
         /// Setup schedulers
-        let scheduler: [Scheduler] = (0..<config.imageCount).map { _ in
+        var schedulers = [Scheduler]()
+        schedulers.reserveCapacity(config.imageCount)
+        for _ in 0..<config.imageCount {
             switch config.schedulerType {
-            case .pndmScheduler: return PNDMScheduler(stepCount: config.stepCount)
-            case .dpmSolverMultistepScheduler: return DPMSolverMultistepScheduler(stepCount: config.stepCount, timeStepSpacing: config.schedulerTimestepSpacing)
-            case .discreteFlowScheduler: return DiscreteFlowScheduler(stepCount: config.stepCount, timeStepShift: config.schedulerTimestepShift)
+            case .pndmScheduler:
+                let scheduler = PNDMScheduler(stepCount: config.stepCount)
+                schedulers.append(scheduler)
+            case .dpmSolverMultistepScheduler:
+                let scheduler = await DPMSolverMultistepScheduler(
+                    stepCount: config.stepCount, timeStepSpacing: config.schedulerTimestepSpacing)
+                schedulers.append(scheduler)
             }
         }
 
         // Generate random latent samples from specified seed
-        var latents: [MLShapedArray<Float32>] = try generateLatentSamples(configuration: config, scheduler: scheduler[0])
+        var latents = try await generateLatentSamples(configuration: config, scheduler: schedulers[0])
 
         // Store denoised latents from scheduler to pass into decoder
-        var denoisedLatents: [MLShapedArray<Float32>] = latents.map { MLShapedArray(converting: $0) }
+        var denoisedLatents = latents.map { $0.cast(to: Float.self) }
 
         if reduceMemory {
-            encoder?.unloadResources()
+            await encoder?.unloadResources()
         }
         let timestepStrength: Float? = config.mode == .imageToImage ? config.strength : nil
-        
-        // Convert cgImage for ControlNet into MLShapedArray
-        let controlNetConds = try config.controlNetInputs.map { cgImage in
-            let shapedArray = try cgImage.planarRGBShapedArray(minValue: 0.0, maxValue: 1.0)
-            return MLShapedArray(
-                concatenating: [shapedArray, shapedArray],
-                alongAxis: 0
-            )
+
+        // Convert cgImage for ControlNet into a tensor
+        let controlNetConds = config.controlNetInputs.map { cgImage in
+            guard let rgbTensor = cgImage.planarRGBTensor() else {
+                fatalError("Failed to create RGB tensor.")
+            }
+            return rgbTensor.tiled(multiples: [2, 1, 1, 1])
         }
 
         // De-noising loop
-        let timeSteps: [Int] = scheduler[0].calculateTimesteps(strength: timestepStrength)
+        let timeSteps: [Int] = schedulers[0].calculateTimesteps(strength: timestepStrength)
         for (step,t) in timeSteps.enumerated() {
 
             // Expand the latents for classifier-free guidance
             // and input to the Unet noise prediction model
-            let latentUnetInput: [MLShapedArray<Float32>]
-            if config.guidanceScale >= 1.0 {
-                latentUnetInput = latents.map {
-                    MLShapedArray<Float32>(concatenating: [$0, $0], alongAxis: 0)
-                }
-            } else {
-                latentUnetInput = latents
+            let latentUnetInput = latents.map {
+                MLTensor(concatenating: [$0, $0], alongAxis: 0)
             }
 
             // Before Unet, execute controlNet and add the output into Unet inputs
-            let additionalResiduals = try controlNet?.execute(
+            let additionalResiduals = try await controlNet?.execute(
                 latents: latentUnetInput,
                 timeStep: t,
                 hiddenStates: hiddenStates,
-                images: controlNetConds
+                images: controlNetConds,
+                weights: config.controlNetWeights
             )
-            
+
             // Predict noise residuals from latent samples
             // and current time step conditioned on hidden states
-            var noise : [MLShapedArray<Float32>]
-            if unet.latentSampleShape[0] >= 2 || config.guidanceScale < 1.0 {
-                // One predict call from the uNet, using batching if needed
-                noise = try unet.predictNoise(
-                  latents: latentUnetInput,
-                  timeStep: t,
-                  hiddenStates: hiddenStates,
-                  additionalResiduals: additionalResiduals
-                )
-            } else {
-                // Serial predictions from uNet
-                var hidden0 = MLShapedArray<Float32>(converting: hiddenStates[0])
-                hidden0 = MLShapedArray(scalars: hidden0.scalars, shape: [1]+hidden0.shape)
-                let noise_pred_uncond = try unet.predictNoise(
-                  latents: latents,
-                  timeStep: t,
-                  hiddenStates: hidden0,
-                  additionalResiduals: additionalResiduals
-                )
+            var noise = try await unet.predictNoise(
+                latents: latentUnetInput,
+                timeStep: t,
+                hiddenStates: hiddenStates,
+                additionalResiduals: additionalResiduals
+            )
 
-                var hidden1 = MLShapedArray<Float32>(converting: hiddenStates[1])
-                hidden1 = MLShapedArray(scalars: hidden1.scalars, shape: [1]+hidden1.shape)
-                let noise_pred_text = try unet.predictNoise(
-                  latents: latents,
-                  timeStep: t,
-                  hiddenStates: hidden1,
-                  additionalResiduals: additionalResiduals
-                )
-
-                noise = [MLShapedArray<Float32>(concatenating: [noise_pred_uncond[0], noise_pred_text[0]],
-                                                alongAxis: 0)]
-            }
-
-            if config.guidanceScale >= 1.0 {
-                noise = performGuidance(noise, config.guidanceScale)
-            }
+            noise = performGuidance(noise, config.guidanceScale)
 
             // Have the scheduler compute the previous (t-1) latent
             // sample given the predicted noise and current sample
             for i in 0..<config.imageCount {
-                latents[i] = scheduler[i].step(
+                latents[i] = schedulers[i].step(
                     output: noise[i],
                     timeStep: t,
                     sample: latents[i]
                 )
-
-                denoisedLatents[i] = scheduler[i].modelOutputs.last ?? latents[i]
+                denoisedLatents[i] = schedulers[i].modelOutputs.last ?? latents[i]
             }
 
             let currentLatentSamples = config.useDenoisedIntermediates ? denoisedLatents : latents
+            var currentPreviewImages: [CGImage?] = []
+            if config.previewFrequency > 0 && step.isMultiple(of: config.previewFrequency) {
+                currentPreviewImages = try await decodeToImages(currentLatentSamples, configuration: config)
+            }
 
             // Report progress
             let progress = Progress(
@@ -341,6 +317,7 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
                 step: step,
                 stepCount: timeSteps.count,
                 currentLatentSamples: currentLatentSamples,
+                currentImages: currentPreviewImages,
                 configuration: config
             )
             if !progressHandler(progress) {
@@ -350,38 +327,47 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
         }
 
         if reduceMemory {
-            controlNet?.unloadResources()
-            unet.unloadResources()
+            await controlNet?.unloadResources()
+            await unet.unloadResources()
         }
 
         // Decode the latent samples to images
-        return try decodeToImages(denoisedLatents, configuration: config)
+        return try await decodeToImages(denoisedLatents, configuration: config)
     }
 
-    func generateLatentSamples(configuration config: Configuration, scheduler: Scheduler) throws -> [MLShapedArray<Float32>] {
-        var sampleShape = unet.latentSampleShape
+    func generateLatentSamples(
+        configuration config: Configuration,
+        scheduler: Scheduler
+    ) async throws -> [MLTensor] {
+        var sampleShape = await unet.latentSampleShape
         sampleShape[0] = 1
-        
+
         let stdev = scheduler.initNoiseSigma
         var random = randomSource(from: config.rngType, seed: config.seed)
         let samples = (0..<config.imageCount).map { _ in
-            MLShapedArray<Float32>(
-                converting: random.normalShapedArray(sampleShape, mean: 0.0, stdev: Double(stdev)))
+            random.normalTensor(sampleShape, mean: 0.0, stdev: stdev)
         }
         if let image = config.startingImage, config.mode == .imageToImage {
             guard let encoder else {
                 throw PipelineError.startingImageProvidedWithoutEncoder
             }
-            let latent = try encoder.encode(image, scaleFactor: config.encoderScaleFactor, random: &random)
+            let latent = try await encoder.encode(
+                image,
+                scaleFactor: config.encoderScaleFactor,
+                random: &random
+            )
             return scheduler.addNoise(originalSample: latent, noise: samples, strength: config.strength)
         }
         return samples
     }
 
-    public func decodeToImages(_ latents: [MLShapedArray<Float32>], configuration config: Configuration) throws -> [CGImage?] {
-        let images = try decoder.decode(latents, scaleFactor: config.decoderScaleFactor)
+    public func decodeToImages(
+        _ latents: [MLTensor],
+        configuration config: Configuration
+    ) async throws -> [CGImage?] {
+        let images = try await decoder.decode(latents, scaleFactor: config.decoderScaleFactor)
         if reduceMemory {
-            decoder.unloadResources()
+            await decoder.unloadResources()
         }
 
         // If safety is disabled return what was decoded
@@ -395,12 +381,14 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
         }
 
         // Otherwise change images which are not safe to nil
-        let safeImages = try images.map { image in
-            try safetyChecker.isSafe(image) ? image : nil
+        var safeImages = [CGImage?]()
+        for image in images {
+            let safeImage = try await safetyChecker.isSafe(image) ? image : nil
+            safeImages.append(safeImage)
         }
 
         if reduceMemory {
-            safetyChecker.unloadResources()
+            await safetyChecker.unloadResources()
         }
 
         return safeImages
@@ -409,23 +397,19 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
 }
 
 /// Sampling progress details
-@available(iOS 16.2, macOS 13.1, *)
 public struct PipelineProgress {
     public let pipeline: StableDiffusionPipelineProtocol
     public let prompt: String
     public let step: Int
     public let stepCount: Int
-    public let currentLatentSamples: [MLShapedArray<Float32>]
+    public let currentLatentSamples: [MLTensor]
+    public let currentImages: [CGImage?]
     public let configuration: PipelineConfiguration
     public var isSafetyEnabled: Bool {
         pipeline.canSafetyCheck && !configuration.disableSafety
     }
-    public var currentImages: [CGImage?] {
-        try! pipeline.decodeToImages(currentLatentSamples, configuration: configuration)
-    }
 }
 
-@available(iOS 16.2, macOS 13.1, *)
 public extension StableDiffusionPipeline {
     /// Sampling progress details
     typealias Progress = PipelineProgress
@@ -433,52 +417,28 @@ public extension StableDiffusionPipeline {
 
 // Helper functions
 
-@available(iOS 16.2, macOS 13.1, *)
 extension StableDiffusionPipelineProtocol {
-    internal func randomSource(from rng: StableDiffusionRNG, seed: UInt32) -> RandomSource {
+    func randomSource(from rng: StableDiffusionRNG, seed: UInt32) -> RandomSource {
         switch rng {
-        case .numpyRNG:
-            return NumPyRandomSource(seed: seed)
-        case .torchRNG:
-            return TorchRandomSource(seed: seed)
-        case .nvidiaRNG:
-            return NvRandomSource(seed: seed)
+        case .numpyRNG: NumPyRandomSource(seed: seed)
+        case .torchRNG: TorchRandomSource(seed: seed)
+        case .nvidiaRNG: NvRandomSource(seed: seed)
+        case .coreml: MLTensorRandomSource(seed: seed)
         }
     }
 
-    func toHiddenStates(_ embedding: MLShapedArray<Float32>) -> MLShapedArray<Float32> {
-        // Unoptimized manual transpose [0, 2, None, 1]
-        // e.g. From [2, 77, 768] to [2, 768, 1, 77]
-        let fromShape = embedding.shape
-        let stateShape = [fromShape[0],fromShape[2], 1, fromShape[1]]
-        var states = MLShapedArray<Float32>(repeating: 0.0, shape: stateShape)
-        for i0 in 0..<fromShape[0] {
-            for i1 in 0..<fromShape[1] {
-                for i2 in 0..<fromShape[2] {
-                    states[scalarAt:i0,i2,0,i1] = embedding[scalarAt:i0, i1, i2]
-                }
-            }
-        }
-        return states
+    /// Transpose `(0, 2, 1)` and expand at `2`.
+    func toHiddenStates(_ embedding: MLTensor) -> MLTensor {
+        embedding.transposed(permutation: [0, 2, 1]).expandingShape(at: 2)
     }
 
-    func performGuidance(_ noise: [MLShapedArray<Float32>], _ guidanceScale: Float) -> [MLShapedArray<Float32>] {
+    func performGuidance(_ noise: [MLTensor], _ guidanceScale: Float) -> [MLTensor] {
         noise.map { performGuidance($0, guidanceScale) }
     }
 
-    func performGuidance(_ noise: MLShapedArray<Float32>, _ guidanceScale: Float) -> MLShapedArray<Float32> {
-        var shape = noise.shape
-        shape[0] = 1
-        return MLShapedArray<Float>(unsafeUninitializedShape: shape) { result, _ in
-            noise.withUnsafeShapedBufferPointer { scalars, _, strides in
-                for i in 0 ..< result.count {
-                    // unconditioned + guidance*(text - unconditioned)
-                    result.initializeElement(
-                        at: i,
-                        to: scalars[i] + guidanceScale * (scalars[strides[0] + i] - scalars[i])
-                    )
-                }
-            }
-        }
+    func performGuidance(_ noise: MLTensor, _ guidanceScale: Float) -> MLTensor {
+        let splitNoise = noise.split(count: 2)
+        let (predictedNoiseUncond, predictedNoiseCond) = (splitNoise[0], splitNoise[1])
+        return predictedNoiseUncond + guidanceScale * (predictedNoiseCond - predictedNoiseUncond)
     }
 }

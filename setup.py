@@ -14,11 +14,11 @@ setup(
     long_description_content_type='text/markdown',
     author='Apple Inc.',
     install_requires=[
-        "coremltools>=8.0",
-        "diffusers[torch]==0.30.2",
+        "coremltools>=7.0b2",
+        "diffusers[torch]",
         "torch",
-        "transformers==4.44.2",
-        "huggingface-hub==0.24.6",
+        "transformers>=4.30.0",
+        "huggingface-hub",
         "scipy",
         "numpy<1.24",
         "pytest",
@@ -26,7 +26,6 @@ setup(
         "invisible-watermark",
         "safetensors",
         "matplotlib",
-        "diffusionkit==0.4.0",
     ],
     packages=find_packages(),
     classifiers=[

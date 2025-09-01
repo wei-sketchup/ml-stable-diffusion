@@ -4,21 +4,19 @@
 import Foundation
 import CoreML
 
-@available(iOS 17.0, macOS 14.0, *)
 public protocol TextEncoderXLModel: ResourceManaging {
-    typealias TextEncoderXLOutput = (hiddenEmbeddings: MLShapedArray<Float32>, pooledOutputs: MLShapedArray<Float32>)
-    func encode(_ text: String) throws -> TextEncoderXLOutput
+    typealias TextEncoderXLOutput = (hiddenEmbeddings: MLTensor, pooledOutputs: MLTensor)
+    func encode(_ text: String) async throws -> TextEncoderXLOutput
 }
 
 ///  A model for encoding text, suitable for SDXL
-@available(iOS 17.0, macOS 14.0, *)
 public struct TextEncoderXL: TextEncoderXLModel {
 
     /// Text tokenizer
-    var tokenizer: BPETokenizer
+    let tokenizer: BPETokenizer
 
     /// Embedding model
-    var model: ManagedMLModel
+    let model: ManagedMLModel
 
     /// Creates text encoder which embeds a tokenized string
     ///
@@ -27,21 +25,19 @@ public struct TextEncoderXL: TextEncoderXLModel {
     ///   - url: Location of compiled text encoding  Core ML model
     ///   - configuration: configuration to be used when the model is loaded
     /// - Returns: A text encoder that will lazily load its required resources when needed or requested
-    public init(tokenizer: BPETokenizer,
-                modelAt url: URL,
-                configuration: MLModelConfiguration) {
+    public init(tokenizer: BPETokenizer, modelAt url: URL, configuration: MLModelConfiguration) {
         self.tokenizer = tokenizer
         self.model = ManagedMLModel(modelAt: url, configuration: configuration)
     }
 
     /// Ensure the model has been loaded into memory
-    public func loadResources() throws {
-        try model.loadResources()
+    public func loadResources() async throws {
+        try await model.loadResources()
     }
 
     /// Unload the underlying model to free up memory
-    public func unloadResources() {
-       model.unloadResources()
+    public func unloadResources() async {
+       await model.unloadResources()
     }
 
     /// Encode input text/string
@@ -49,8 +45,10 @@ public struct TextEncoderXL: TextEncoderXLModel {
     ///  - Parameters:
     ///     - text: Input text to be tokenized and then embedded
     ///  - Returns: Embedding representing the input text
-    public func encode(_ text: String) throws -> TextEncoderXLOutput {
-
+    public func encode(_ text: String) async throws -> TextEncoderXLOutput {
+        guard let inputShape = try await model.firstInputShape() else {
+            fatalError("Failed to obtain input shape \(#file) \(#line)")
+        }
         // Get models expected input length
         let inputLength = inputShape.last!
 
@@ -66,34 +64,30 @@ public struct TextEncoderXL: TextEncoderXLModel {
         }
 
         // Use the model to generate the embedding
-        return try encode(ids: ids)
+        return try await encode(ids: ids)
     }
 
-    func encode(ids: [Int]) throws -> TextEncoderXLOutput {
-        let inputName = inputDescription.name
-        let inputShape = inputShape
+    func encode(ids: [Int]) async throws -> TextEncoderXLOutput {
+        guard
+            let inputName = try await model.firstInputName(),
+            let inputShape = try await model.firstInputShape()
+        else {
+            fatalError("Failed to obtain input name and/or shape \(#file) \(#line)")
+        }
 
         let floatIds = ids.map { Float32($0) }
-        let inputArray = MLShapedArray<Float32>(scalars: floatIds, shape: inputShape)
-        let inputFeatures = try! MLDictionaryFeatureProvider(
-            dictionary: [inputName: MLMultiArray(inputArray)])
+        let inputTensor = MLTensor(shape: inputShape, scalars: floatIds)
 
-        let result = try model.perform { model in
-            try model.prediction(from: inputFeatures)
+        let outputs = try await model.perform { model in
+            try await model.prediction(from: [inputName: inputTensor])
         }
 
-        let embeddingFeature = result.featureValue(for: "hidden_embeds")
-        let pooledFeature = result.featureValue(for: "pooled_outputs")
-        return (MLShapedArray<Float32>(converting: embeddingFeature!.multiArrayValue!), MLShapedArray<Float32>(converting: pooledFeature!.multiArrayValue!))
-    }
-
-    var inputDescription: MLFeatureDescription {
-        try! model.perform { model in
-            model.modelDescription.inputDescriptionsByName.first!.value
+        guard
+            let embeddingFeature = outputs["hidden_embeds"],
+            let pooledFeature = outputs["pooled_outputs"]
+        else {
+            fatalError("Missing output(s) \(#file) \(#line)")
         }
-    }
-
-    var inputShape: [Int] {
-        inputDescription.multiArrayConstraint!.shape.map { $0.intValue }
+        return (embeddingFeature, pooledFeature)
     }
 }

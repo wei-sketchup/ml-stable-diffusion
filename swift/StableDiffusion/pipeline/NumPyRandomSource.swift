@@ -9,7 +9,6 @@ import CoreML
 ///  This implementation matches:
 ///  [NumPy's older randomkit.c](https://github.com/numpy/numpy/blob/v1.0/numpy/random/mtrand/randomkit.c)
 ///
-@available(iOS 16.2, macOS 13.1, *)
 struct NumPyRandomSource: RandomNumberGenerator, RandomSource {
 
     struct State {
@@ -111,9 +110,13 @@ struct NumPyRandomSource: RandomNumberGenerator, RandomSource {
         (0 ..< count).map { _ in nextNormal(mean: mean, stdev: stdev) }
     }
 
-    /// Generate a shaped array with scalars from a normal distribution with given mean and standard deviation.
-    mutating func normalShapedArray(_ shape: [Int], mean: Double = 0.0, stdev: Double = 1.0) -> MLShapedArray<Double> {
+    /// Generate a tensor with scalars from a normal distribution with given mean and standard deviation.
+    mutating func normalTensor(_ shape: [Int], mean: Float = 0.0, stdev: Float = 1.0) -> MLTensor {
         let count = shape.reduce(1, *)
-        return .init(scalars: normalArray(count: count, mean: mean, stdev: stdev), shape: shape)
+        let fp64ShapedArray = MLShapedArray(
+          scalars: normalArray(count: count, mean: Double(mean), stdev: Double(stdev)),
+          shape: shape
+        )
+        return MLTensor(MLShapedArray<Float32>(converting: fp64ShapedArray))
     }
 }

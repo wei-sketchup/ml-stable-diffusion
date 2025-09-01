@@ -16,12 +16,7 @@ from diffusers import (
     DiffusionPipeline,
     ControlNetModel
 )
-from diffusionkit.tests.torch2coreml import (
-    convert_mmdit_to_mlpackage,
-    convert_vae_to_mlpackage
-)
 import gc
-from huggingface_hub import snapshot_download
 
 import logging
 
@@ -126,11 +121,10 @@ def _convert_to_coreml(submodule_name, torchscript_module, sample_inputs,
         coreml_model.compute_unit = compute_unit
     else:
         logger.info(f"Converting {submodule_name} to CoreML..")
-        deployment_target = _get_deployment_target(args.min_deployment_target)
         coreml_model = ct.convert(
             torchscript_module,
             convert_to="mlprogram",
-            minimum_deployment_target=deployment_target,
+            minimum_deployment_target=ct.target.macOS13,
             inputs=_get_coreml_inputs(sample_inputs, args),
             outputs=[ct.TensorType(name=name, dtype=np.float32) for name in output_names],
             compute_units=compute_unit,
@@ -142,41 +136,6 @@ def _convert_to_coreml(submodule_name, torchscript_module, sample_inputs,
         gc.collect()
 
     return coreml_model, out_path
-
-
-def _get_deployment_target(target_string):
-    """
-    Convert deployment target string to coremltools target object.
-    
-    Args:
-        target_string (str): Target deployment string (e.g., "macOS13", "iOS18")
-        
-    Returns:
-        coremltools target object
-    """
-    target_map = {
-        "macOS13": ct.target.macOS13,
-        "macOS14": ct.target.macOS14,
-        "iOS16": ct.target.iOS16,
-        "iOS17": ct.target.iOS17,
-    }
-    
-    # Handle newer targets that might not be available in older coremltools versions
-    try:
-        if target_string == "macOS15":
-            return ct.target.macOS15
-        elif target_string == "iOS18":
-            return ct.target.iOS18
-    except AttributeError:
-        logger.warning(f"Deployment target {target_string} not available in this coremltools version. "
-                      f"Using macOS14 as fallback.")
-        return ct.target.macOS14
-    
-    if target_string in target_map:
-        return target_map[target_string]
-    else:
-        logger.warning(f"Unknown deployment target {target_string}. Using macOS13 as fallback.")
-        return ct.target.macOS13
 
 
 def quantize_weights(args):
@@ -248,26 +207,6 @@ def _compile_coreml_model(source_model_path, output_dir, final_name):
     return target_path
 
 
-def _download_t5_model(args, t5_save_path):
-    t5_url = args.text_encoder_t5_url
-    match = re.match(r'https://huggingface.co/(.+)/resolve/main/(.+)', t5_url)
-    if not match:
-        raise ValueError(f"Invalid Hugging Face URL: {t5_url}")
-    repo_id, model_subpath = match.groups()
-
-    download_path = snapshot_download(
-        repo_id=repo_id,
-        revision="main",
-        allow_patterns=[f"{model_subpath}/*"]
-    )
-    logger.info(f"Downloaded T5 model to {download_path}")
-
-    # Move the downloaded model to the top level of the Resources directory
-    logger.info(f"Copying T5 model from {download_path} to {t5_save_path}")
-    cache_path = os.path.join(download_path, model_subpath)
-    shutil.copytree(cache_path, t5_save_path)
-
-
 def bundle_resources_for_swift_cli(args):
     """
     - Compiles Core ML models from mlpackage into mlmodelc format
@@ -289,7 +228,6 @@ def bundle_resources_for_swift_cli(args):
                                      ("refiner", "UnetRefiner"),
                                      ("refiner_chunk1", "UnetRefinerChunk1"),
                                      ("refiner_chunk2", "UnetRefinerChunk2"),
-                                     ("mmdit", "MultiModalDiffusionTransformer"),
                                      ("control-unet", "ControlledUnet"),
                                      ("control-unet_chunk1", "ControlledUnetChunk1"),
                                      ("control-unet_chunk2", "ControlledUnetChunk2"),
@@ -333,33 +271,12 @@ def bundle_resources_for_swift_cli(args):
         f.write(requests.get(args.text_encoder_merges_url).content)
     logger.info("Done")
 
-    # Fetch and save pre-converted T5 text encoder model
-    t5_model_name = "TextEncoderT5.mlmodelc"
-    t5_save_path = os.path.join(resources_dir, t5_model_name)
-    if args.include_t5:
-        if not os.path.exists(t5_save_path):
-            logger.info("Downloading pre-converted T5 encoder model TextEncoderT5.mlmodelc")
-            _download_t5_model(args, t5_save_path)
-            logger.info("Done")
-        else:
-            logger.info(f"Skipping T5 download as {t5_save_path} already exists")
-            
-        # Fetch and save T5 text tokenizer JSON files
-        logger.info("Downloading and saving T5 tokenizer files tokenizer_config.json and tokenizer.json")
-        with open(os.path.join(resources_dir, "tokenizer_config.json"), "wb") as f:
-            f.write(requests.get(args.text_encoder_t5_config_url).content)
-        with open(os.path.join(resources_dir, "tokenizer.json"), "wb") as f:
-            f.write(requests.get(args.text_encoder_t5_data_url).content)
-        logger.info("Done")
-
     return resources_dir
 
 
 from transformers.models.clip import modeling_clip
 
 # Copied from https://github.com/huggingface/transformers/blob/v4.30.0/src/transformers/models/clip/modeling_clip.py#L677C1-L692C1
-# Starting from transformers >= 4.35.0, the _make_causal_mask function is replaced by _create_4d_causal_attention_mask in modeling_clip.
-# For backward compatibility with versions < 4.35.0, both functions are patched here.
 def patched_make_causal_mask(input_ids_shape, dtype, device, past_key_values_length: int = 0):
     """ Patch to replace torch.finfo(dtype).min with -1e4
     """
@@ -372,9 +289,8 @@ def patched_make_causal_mask(input_ids_shape, dtype, device, past_key_values_len
     if past_key_values_length > 0:
         mask = torch.cat([torch.zeros(tgt_len, past_key_values_length, dtype=dtype, device=device), mask], dim=-1)
     return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
-    
-modeling_clip._make_causal_mask = patched_make_causal_mask # For transformers >= 4.30.0 and transformers < 4.35.0
-modeling_clip._create_4d_causal_attention_mask = patched_make_causal_mask # For transformers >= 4.35.0
+
+modeling_clip._make_causal_mask = patched_make_causal_mask
 
 def convert_text_encoder(text_encoder, tokenizer, submodule_name, args):
     """ Converts the text encoder component of Stable Diffusion
@@ -641,61 +557,6 @@ def convert_vae_decoder(pipe, args):
     del traced_vae_decoder, pipe.vae.decoder, coreml_vae_decoder
     gc.collect()
 
-def convert_vae_decoder_sd3(args):
-    """ Converts the VAE component of Stable Diffusion 3
-    """
-    out_path = _get_out_path(args, "vae_decoder")
-    if os.path.exists(out_path):
-        logger.info(
-            f"`vae_decoder` already exists at {out_path}, skipping conversion."
-        )
-        return
-    
-    # Convert the VAE Decoder model via DiffusionKit
-    converted_vae_path = convert_vae_to_mlpackage(
-        model_version=args.model_version, 
-        latent_h=args.latent_h, 
-        latent_w=args.latent_w, 
-        output_dir=args.o,
-    )
-
-    # Load converted model
-    coreml_vae_decoder = ct.models.MLModel(converted_vae_path)
-
-    # Set model metadata
-    coreml_vae_decoder.author = f"Please refer to the Model Card available at huggingface.co/{args.model_version}"
-    coreml_vae_decoder.license = "Stability AI Community License (https://huggingface.co/stabilityai/stable-diffusion-3-medium/blob/main/LICENSE.md)"
-    coreml_vae_decoder.version = args.model_version
-    coreml_vae_decodershort_description = \
-        "Stable Diffusion 3 generates images conditioned on text or other images as input through the diffusion process. " \
-        "Please refer to https://arxiv.org/pdf/2403.03206 for details."
-
-    # Set the input descriptions
-    coreml_vae_decoder.input_description["z"] = \
-        "The denoised latent embeddings from the unet model after the last step of reverse diffusion"
-
-    # Set the output descriptions
-    coreml_vae_decoder.output_description[
-        "image"] = "Generated image normalized to range [-1, 1]"
-
-    # Set package version metadata
-    from python_coreml_stable_diffusion._version import __version__
-    coreml_vae_decoder.user_defined_metadata["com.github.apple.ml-stable-diffusion.version"] = __version__
-    from diffusionkit.version import __version__
-    coreml_vae_decoder.user_defined_metadata["com.github.argmax.diffusionkit.version"] = __version__
-
-    # Save the updated model
-    coreml_vae_decoder.save(out_path)
-
-    logger.info(f"Saved vae_decoder into {out_path}")
-
-    # Delete the original file
-    if os.path.exists(converted_vae_path):
-        shutil.rmtree(converted_vae_path)
-
-    del coreml_vae_decoder
-    gc.collect()
-
 
 def convert_vae_encoder(pipe, args):
     """ Converts the VAE Encoder component of Stable Diffusion
@@ -711,10 +572,10 @@ def convert_vae_encoder(pipe, args):
         raise RuntimeError(
             "convert_unet() deletes pipe.unet to save RAM. "
             "Please use convert_vae_encoder() before convert_unet()")
-    
+
     height = (args.latent_h or pipe.unet.config.sample_size) * 8
     width = (args.latent_w or pipe.unet.config.sample_size) * 8
-    
+
     x_shape = (
         1,  # B
         3,  # C (RGB range from -1 to 1)
@@ -796,7 +657,7 @@ def convert_vae_encoder(pipe, args):
     gc.collect()
 
 
-def convert_unet(pipe, args, model_name=None):
+def convert_unet(pipe, args, model_name = None):
     """ Converts the UNet component of Stable Diffusion
     """
     if args.unet_support_controlnet:
@@ -822,8 +683,6 @@ def convert_unet(pipe, args, model_name=None):
     elif not os.path.exists(out_path):
         # Prepare sample input shapes and values
         batch_size = 2  # for classifier-free guidance
-        if args.unet_batch_one:
-            batch_size = 1  # for not using classifier-free guidance
         sample_shape = (
             batch_size,                    # B
             pipe.unet.config.in_channels,  # C
@@ -835,7 +694,7 @@ def convert_unet(pipe, args, model_name=None):
             raise RuntimeError(
                 "convert_text_encoder() deletes pipe.text_encoder to save RAM. "
                 "Please use convert_unet() before convert_text_encoder()")
-        
+
         if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
             text_token_sequence_length = pipe.text_encoder.config.max_position_embeddings
             hidden_size = pipe.text_encoder.config.hidden_size,
@@ -912,10 +771,15 @@ def convert_unet(pipe, args, model_name=None):
         else:
             unet_cls = unet.UNet2DConditionModel
 
-        reference_unet = unet_cls(support_controlnet=args.unet_support_controlnet, **pipe.unet.config).eval()
+        reference_unet = unet_cls(**pipe.unet.config).eval()
 
-        load_state_dict_summary = reference_unet.load_state_dict(
-            pipe.unet.state_dict())
+        lora_weights_attached = hasattr(pipe.unet, "peft_config")
+        if lora_weights_attached:
+            lora_key = list(pipe.unet.peft_config.keys())[0]
+            lora_config = pipe.unet.peft_config[lora_key]
+            unet.attach_lora_weights(reference_unet, lora_key, lora_config)
+
+        load_state_dict_summary = reference_unet.load_state_dict(pipe.unet.state_dict())
 
         if args.unet_support_controlnet:
             from .unet import calculate_conv2d_output_shape
@@ -929,7 +793,7 @@ def convert_unet(pipe, args, model_name=None):
             )
             additional_residuals_shapes.append(
                 (batch_size, reference_unet.conv_in.out_channels, out_h, out_w))
-            
+
             # down_blocks
             for down_block in reference_unet.down_blocks:
                 additional_residuals_shapes += [
@@ -940,7 +804,7 @@ def convert_unet(pipe, args, model_name=None):
                         out_h, out_w = calculate_conv2d_output_shape(out_h, out_w, downsampler.conv)
                     additional_residuals_shapes.append(
                         (batch_size, down_block.downsamplers[-1].conv.out_channels, out_h, out_w))
-            
+
             # mid_block
             additional_residuals_shapes.append(
                 (batch_size, reference_unet.mid_block.resnets[-1].out_channels, out_h, out_w)
@@ -1024,6 +888,11 @@ def convert_unet(pipe, args, model_name=None):
         from python_coreml_stable_diffusion._version import __version__
         coreml_unet.user_defined_metadata["com.github.apple.ml-stable-diffusion.version"] = __version__
 
+        # Set LoRA model Id, if available
+        if lora_weights_attached:
+            assert lora_key is not None
+            coreml_unet.user_defined_metadata["lora_model"] = lora_key
+
         coreml_unet.save(out_path)
         logger.info(f"Saved unet into {out_path}")
 
@@ -1050,72 +919,6 @@ def convert_unet(pipe, args, model_name=None):
         chunk_mlprogram.main(args)
 
 
-def convert_mmdit(args):
-    """ Converts the MMDiT component of Stable Diffusion 3
-    """
-    out_path = _get_out_path(args, "mmdit")
-    if os.path.exists(out_path):
-        logger.info(
-            f"`mmdit` already exists at {out_path}, skipping conversion."
-        )
-        return
-    
-    # Convert the MMDiT model via DiffusionKit
-    converted_mmdit_path = convert_mmdit_to_mlpackage(
-        model_version=args.model_version, 
-        latent_h=args.latent_h, 
-        latent_w=args.latent_w, 
-        output_dir=args.o,
-        # FIXME: Hardcoding to CPU_AND_GPU since ANE doesn't support FLOAT32
-        compute_precision=ct.precision.FLOAT32,
-        compute_unit=ct.ComputeUnit.CPU_AND_GPU,
-    )
-
-    # Load converted model
-    coreml_mmdit = ct.models.MLModel(converted_mmdit_path)
-
-    # Set model metadata
-    coreml_mmdit.author = f"Please refer to the Model Card available at huggingface.co/{args.model_version}"
-    coreml_mmdit.license = "Stability AI Community License (https://huggingface.co/stabilityai/stable-diffusion-3-medium/blob/main/LICENSE.md)"
-    coreml_mmdit.version = args.model_version
-    coreml_mmdit.short_description = \
-    "Stable Diffusion 3 generates images conditioned on text or other images as input through the diffusion process. " \
-    "Please refer to https://arxiv.org/pdf/2403.03206 for details."
-
-    # Set the input descriptions
-    coreml_mmdit.input_description["latent_image_embeddings"] = \
-        "The low resolution latent feature maps being denoised through reverse diffusion"
-    coreml_mmdit.input_description["token_level_text_embeddings"] = \
-        "Output embeddings from the associated text_encoder model to condition to generated image on text. " \
-        "A maximum of 77 tokens (~40 words) are allowed. Longer text is truncated. "
-    coreml_mmdit.input_description["pooled_text_embeddings"] = \
-        "Additional embeddings that if specified are added to the embeddings that are passed along to the MMDiT model."
-    coreml_mmdit.input_description["timestep"] = \
-        "A value emitted by the associated scheduler object to condition the model on a given noise schedule"
-    
-    # Set the output descriptions
-    coreml_mmdit.output_description["denoiser_output"] = \
-        "Same shape and dtype as the `latent_image_embeddings` input. " \
-        "The predicted noise to facilitate the reverse diffusion (denoising) process"
-
-    # Set package version metadata
-    from python_coreml_stable_diffusion._version import __version__
-    coreml_mmdit.user_defined_metadata["com.github.apple.ml-stable-diffusion.version"] = __version__
-    from diffusionkit.version import __version__
-    coreml_mmdit.user_defined_metadata["com.github.argmax.diffusionkit.version"] = __version__
-
-    # Save the updated model
-    coreml_mmdit.save(out_path)
-
-    logger.info(f"Saved vae_decoder into {out_path}")
-
-    # Delete the original file
-    if os.path.exists(converted_mmdit_path):
-        shutil.rmtree(converted_mmdit_path)
-
-    del coreml_mmdit
-    gc.collect()
-
 def convert_safety_checker(pipe, args):
     """ Converts the Safety Checker component of Stable Diffusion
     """
@@ -1134,7 +937,7 @@ def convert_safety_checker(pipe, args):
         return
 
     pipe.safety_checker = pipe.safety_checker.to(torch.float32)
-    
+
     im_h = pipe.vae.config.sample_size
     im_w = pipe.vae.config.sample_size
 
@@ -1482,6 +1285,37 @@ def convert_controlnet(pipe, args):
         del coreml_controlnet
         gc.collect()
 
+
+def validate_lora_compatibility(pipe):
+    if not hasattr(pipe.unet, "peft_config"):
+        logger.warn("`peft_config` is not set for `unet`, LoRA weights may not be loaded correctly")
+        return
+
+    if len(pipe.unet.peft_config) > 1:
+        raise RuntimeError("Currently only one PEFT configuration is supported, found more than one.")
+
+    lora_key = list(pipe.unet.peft_config.keys())[0]
+    if pipe.unet.peft_config[lora_key].peft_type != 'LORA':
+        raise RuntimeError(f"Incompatible PEFT, loaded type `{pipe.unet.peft_config[lora_key].peft_type}` but only `LORA` is supported.")
+
+    if pipe.unet.peft_config[lora_key].use_dora:
+        raise RuntimeError("Incompatible PEFT, `use_dora` is not supported.")
+
+    # Ensure no other module has adapters attached.
+    modules = [getattr(pipe, field)
+                for field in dir(pipe)
+                if hasattr(pipe, field) and isinstance(getattr(pipe, field), torch.nn.Module)]
+    for module in modules:
+        if module == pipe.unet:
+            continue
+        assert not hasattr(module, "peft_config")
+        if hasattr(module, "peft_config"):
+            logger.warn(f"""
+                Expecting `peft_config` only to be assigned to `unet` but found assigned to \ `{module.__class__.__name__}`. \
+                These will be ignored on the converted model, therefore results may differ from original.
+                """)
+
+
 def get_pipeline(args):
     model_version = args.model_version
 
@@ -1495,22 +1329,21 @@ def get_pipeline(args):
                                             use_safetensors=True,
                                             vae=vae,
                                             use_auth_token=True)
-    elif args.sd3_version:
-        # SD3 uses standard SDXL diffusers pipeline besides the vae, denoiser, and T5 text encoder
-        sdxl_base_version = "stabilityai/stable-diffusion-xl-base-1.0"
-        args.xl_version = True
-        logger.info(f"SD3 version specified, initializing DiffusionPipeline with {sdxl_base_version} for non-SD3 components..")
-        pipe = DiffusionPipeline.from_pretrained(sdxl_base_version,
-                                            torch_dtype=torch.float16,
-                                            variant="fp16",
-                                            use_safetensors=True,
-                                            use_auth_token=True)
     else:
         pipe = DiffusionPipeline.from_pretrained(model_version,
                                             torch_dtype=torch.float16,
                                             variant="fp16",
                                             use_safetensors=True,
                                             use_auth_token=True)
+
+    if args.lora_model_id and args.lora_weights_file:
+        logger.info(f"Loading LoRA model {args.lora_model_id} {args.lora_weights_file}")
+        pipe.load_lora_weights(
+            args.lora_model_id,
+            weight_name=args.lora_weights_file,
+            adapter_name=args.lora_model_id
+        )
+        validate_lora_compatibility(pipe)
 
     logger.info(f"Done. Pipeline in effect: {pipe.__class__.__name__}")
 
@@ -1533,10 +1366,7 @@ def main(args):
     # Convert models
     if args.convert_vae_decoder:
         logger.info("Converting vae_decoder")
-        if args.sd3_version:
-            convert_vae_decoder_sd3(args)
-        else:
-            convert_vae_decoder(pipe, args)
+        convert_vae_decoder(pipe, args)
         logger.info("Converted vae_decoder")
 
     if args.convert_vae_encoder:
@@ -1548,7 +1378,7 @@ def main(args):
         logger.info("Converting controlnet")
         convert_controlnet(pipe, args)
         logger.info("Converted controlnet")
-        
+
     if args.convert_unet:
         logger.info("Converting unet")
         convert_unet(pipe, args)
@@ -1578,16 +1408,11 @@ def main(args):
         original_model_version = args.model_version
         args.model_version = args.refiner_version
         pipe = get_pipeline(args)
-        args.model_version = original_model_version 
+        args.model_version = original_model_version
         convert_unet(pipe, args, model_name="refiner")
         del pipe
         gc.collect()
         logger.info(f"Converted refiner")
-    
-    if args.convert_mmdit:
-        logger.info("Converting mmdit")
-        convert_mmdit(args)
-        logger.info("Converted mmdit")
 
     if args.quantize_nbits is not None:
         logger.info(f"Quantizing weights to {args.quantize_nbits}-bit precision")
@@ -1608,11 +1433,10 @@ def parser_spec():
     parser.add_argument("--convert-vae-decoder", action="store_true")
     parser.add_argument("--convert-vae-encoder", action="store_true")
     parser.add_argument("--convert-unet", action="store_true")
-    parser.add_argument("--convert-mmdit", action="store_true")
     parser.add_argument("--convert-safety-checker", action="store_true")
     parser.add_argument(
-        "--convert-controlnet", 
-        nargs="*", 
+        "--convert-controlnet",
+        nargs="*",
         type=str,
         help=
         "Converts a ControlNet model hosted on HuggingFace to coreML format. " \
@@ -1715,14 +1539,6 @@ def parser_spec():
         "If specified, enable unet to receive additional inputs from controlnet. "
         "Each input added to corresponding resnet output."
         )
-    parser.add_argument(
-        "--unet-batch-one",
-        action="store_true",
-        help=
-        "If specified, a batch size of one will be used for the unet, this is needed if you do not want to do "
-        "classifier free guidance. Default unet batch size is two, which is needed for classifier free guidance."
-        )
-    parser.add_argument("--include-t5", action="store_true")
 
     # Swift CLI Resource Bundling
     parser.add_argument(
@@ -1743,39 +1559,20 @@ def parser_spec():
         "https://huggingface.co/openai/clip-vit-base-patch32/resolve/main/merges.txt",
         help="The URL to the merged pairs used in by the text tokenizer.")
     parser.add_argument(
-        "--text-encoder-t5-url",
-        default=
-        "https://huggingface.co/argmaxinc/coreml-stable-diffusion-3-medium/resolve/main/TextEncoderT5.mlmodelc",
-        help="The URL to the pre-converted T5 encoder model.")
-    parser.add_argument(
-        "--text-encoder-t5-config-url",
-        default=
-        "https://huggingface.co/google-t5/t5-small/resolve/main/tokenizer_config.json",
-        help="The URL to the merged pairs used in by the text tokenizer.")
-    parser.add_argument(
-        "--text-encoder-t5-data-url",
-        default=
-        "https://huggingface.co/google-t5/t5-small/resolve/main/tokenizer.json",
-        help="The URL to the merged pairs used in by the text tokenizer.")
-    parser.add_argument(
-        "--min-deployment-target",
-        default="macOS13",
-        help=(
-            "Minimum deployment target for Core ML models. "
-            "Valid options include macOS13, macOS14, macOS15, iOS16, iOS17, iOS18. "
-            "For iOS 18 compatibility with advanced quantization features, use iOS18. "
-            "Default is macOS13 for backwards compatibility."
-        )
-    )
-    parser.add_argument(
         "--xl-version",
         action="store_true",
         help=("If specified, the pre-trained model will be treated as an instantiation of "
         "`diffusers.pipelines.StableDiffusionXLPipeline` instead of `diffusers.pipelines.StableDiffusionPipeline`"))
     parser.add_argument(
-        "--sd3-version",
-        action="store_true",
-        help=("If specified, the pre-trained model will be treated as an SD3 model."))
+        "--lora-model-id",
+        default=None,
+        help=
+        "The LoRA model repo in the Hugging Face Hub, or the path to a local folder containing LoRA adapters. "
+        "`lora-weights-file` must also be set if `lora-model-id` is specified.")
+    parser.add_argument(
+        "--lora-weights-file",
+        default=None,
+        help="The LoRA adapter weights file. `lora-model-id` must also be set if `lora-weights-file` is specified.")
 
     return parser
 

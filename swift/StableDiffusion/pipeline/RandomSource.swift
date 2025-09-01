@@ -1,8 +1,12 @@
 import CoreML
 
-@available(iOS 16.2, macOS 13.1, *)
 public protocol RandomSource {
-    mutating func nextNormal(mean: Double, stdev: Double) -> Double
-    
-    mutating func normalShapedArray(_ shape: [Int], mean: Double, stdev: Double) -> MLShapedArray<Double>
+    /// Generate a tensor with scalars from a normal distribution with given mean and standard deviation.
+    mutating func normalTensor(_ shape: [Int], mean: Float, stdev: Float) -> MLTensor
+}
+
+extension RandomSource {
+    mutating func normalTensor(_ shape: [Int]) -> MLTensor {
+        normalTensor(shape, mean: 0.0, stdev: 1.0)
+    }
 }

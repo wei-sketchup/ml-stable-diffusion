@@ -1,4 +1,4 @@
-// swift-tools-version: 5.8
+// swift-tools-version: 5.9
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
@@ -6,8 +6,8 @@ import PackageDescription
 let package = Package(
     name: "stable-diffusion",
     platforms: [
-        .macOS(.v13),
-        .iOS(.v16),
+        .macOS("15.0.internal"),
+        .iOS("18.0.internal"),
     ],
     products: [
         .library(
@@ -15,18 +15,18 @@ let package = Package(
             targets: ["StableDiffusion"]),
         .executable(
             name: "StableDiffusionSample",
-            targets: ["StableDiffusionCLI"])
+            targets: ["StableDiffusionCLI"]),
+        .executable(
+            name: "StableDiffusionRunner",
+            targets: ["StableDiffusionRunner"])
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.2.3"),
-        .package(url: "https://github.com/huggingface/swift-transformers.git", exact: "0.1.8"),
+        .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.2.3")
     ],
     targets: [
         .target(
             name: "StableDiffusion",
-            dependencies:  [
-                .product(name: "Transformers", package: "swift-transformers"),
-            ],
+            dependencies: [],
             path: "swift/StableDiffusion"),
         .executableTarget(
             name: "StableDiffusionCLI",
@@ -34,6 +34,13 @@ let package = Package(
                 "StableDiffusion",
                 .product(name: "ArgumentParser", package: "swift-argument-parser")],
             path: "swift/StableDiffusionCLI"),
+        .executableTarget(
+            name: "StableDiffusionRunner",
+            dependencies: [
+                "StableDiffusion",
+                .product(name: "ArgumentParser", package: "swift-argument-parser")
+            ],
+            path: "swift/StableDiffusionRunner"),
         .testTarget(
             name: "StableDiffusionTests",
             dependencies: ["StableDiffusion"],

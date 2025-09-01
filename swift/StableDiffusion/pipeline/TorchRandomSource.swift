@@ -12,7 +12,6 @@ import CoreML
 ///  https://github.com/pytorch/pytorch/blob/master/aten/src/ATen/native/cpu/DistributionKernels.cpp
 ///  https://github.com/pytorch/pytorch/blob/master/aten/src/ATen/core/TransformationHelper.h
 ///
-@available(iOS 16.2, macOS 13.1, *)
 struct TorchRandomSource: RandomNumberGenerator, RandomSource {
 
   struct State {
@@ -104,7 +103,7 @@ struct TorchRandomSource: RandomNumberGenerator, RandomSource {
     state.nextGauss = radius * sin(theta)
     return radius * cos(theta)
   }
-    
+
   /// Generates a random value from a normal distribution with given mean and standard deviation.
   mutating func nextNormal(mean: Double = 0.0, stdev: Double = 1.0) -> Double {
     nextGauss() * stdev + mean
@@ -149,9 +148,12 @@ struct TorchRandomSource: RandomNumberGenerator, RandomSource {
     return data
   }
 
-  /// Generate a shaped array with scalars from a normal distribution with given mean and standard deviation.
-  mutating func normalShapedArray(_ shape: [Int], mean: Double = 0.0, stdev: Double = 1.0) -> MLShapedArray<Double> {
+  mutating func normalTensor(_ shape: [Int], mean: Float = 0.0, stdev: Float = 1.0) -> MLTensor {
     let count = shape.reduce(1, *)
-    return .init(scalars: normalArray(count: count, mean: mean, stdev: stdev), shape: shape)
+      let fp64ShapedArray = MLShapedArray(
+        scalars: normalArray(count: count, mean: Double(mean), stdev: Double(stdev)),
+        shape: shape
+      )
+      return MLTensor(MLShapedArray<Float32>(converting: fp64ShapedArray))
   }
 }

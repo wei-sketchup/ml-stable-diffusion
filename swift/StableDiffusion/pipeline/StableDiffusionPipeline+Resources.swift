@@ -5,7 +5,6 @@ import Foundation
 import CoreML
 import NaturalLanguage
 
-@available(iOS 16.2, macOS 13.1, *)
 public extension StableDiffusionPipeline {
 
     struct ResourceURLs {
@@ -54,6 +53,7 @@ public extension StableDiffusionPipeline {
     ///   - reduceMemory: Setup pipeline in reduced memory mode
     ///   - useMultilingualTextEncoder: Option to use system multilingual NLContextualEmbedding as encoder
     ///   - script: Optional natural language script to use for the text encoder.
+    ///   - unetFunctionName: The U-net function name to use.
     /// - Returns:
     ///  Pipeline ready for image generation if all  necessary resources loaded
     init(
@@ -63,29 +63,19 @@ public extension StableDiffusionPipeline {
         disableSafety: Bool = false,
         reduceMemory: Bool = false,
         useMultilingualTextEncoder: Bool = false,
-        script: Script? = nil
+        script: Script? = nil,
+        unetFunctionName: String? = nil
     ) throws {
 
         /// Expect URL of each resource
         let urls = ResourceURLs(resourcesAt: baseURL)
-        let textEncoder: TextEncoderModel
 
-#if canImport(NaturalLanguage.NLScript)
-        if useMultilingualTextEncoder {
-            guard #available(macOS 14.0, iOS 17.0, *) else { throw PipelineError.unsupportedOSVersion }
-            textEncoder = MultilingualTextEncoder(
-                modelAt: urls.multilingualTextEncoderProjectionURL,
-                configuration: config,
-                script: script ?? .latin
-            )
-        } else {
-            let tokenizer = try BPETokenizer(mergesAt: urls.mergesURL, vocabularyAt: urls.vocabURL)
-            textEncoder = TextEncoder(tokenizer: tokenizer, modelAt: urls.textEncoderURL, configuration: config)
-        }
-#else
         let tokenizer = try BPETokenizer(mergesAt: urls.mergesURL, vocabularyAt: urls.vocabURL)
-        textEncoder = TextEncoder(tokenizer: tokenizer, modelAt: urls.textEncoderURL, configuration: config)
-#endif
+        let textEncoder = TextEncoder(
+            tokenizer: tokenizer,
+            modelAt: urls.textEncoderURL,
+            configuration: config
+        )
 
         // ControlNet model
         var controlNet: ControlNet? = nil
@@ -100,7 +90,7 @@ public extension StableDiffusionPipeline {
         // Unet model
         let unet: Unet
         let unetURL: URL, unetChunk1URL: URL, unetChunk2URL: URL
-        
+
         // if ControlNet available, Unet supports additional inputs from ControlNet
         if controlNet == nil {
             unetURL = urls.unetURL
@@ -111,13 +101,16 @@ public extension StableDiffusionPipeline {
             unetChunk1URL = urls.controlledUnetChunk1URL
             unetChunk2URL = urls.controlledUnetChunk2URL
         }
-        
+
         if FileManager.default.fileExists(atPath: unetChunk1URL.path) &&
             FileManager.default.fileExists(atPath: unetChunk2URL.path) {
-            unet = Unet(chunksAt: [unetChunk1URL, unetChunk2URL],
-                        configuration: config)
+            unet = Unet(
+                chunksAt: [unetChunk1URL, unetChunk2URL],
+                configuration: config,
+                functionName: unetFunctionName
+            )
         } else {
-            unet = Unet(modelAt: unetURL, configuration: config)
+            unet = Unet(modelAt: unetURL, configuration: config, functionName: unetFunctionName)
         }
 
         // Image Decoder
@@ -129,7 +122,7 @@ public extension StableDiffusionPipeline {
             FileManager.default.fileExists(atPath: urls.safetyCheckerURL.path) {
             safetyChecker = SafetyChecker(modelAt: urls.safetyCheckerURL, configuration: config)
         }
-        
+
         // Optional Image Encoder
         let encoder: Encoder?
         if FileManager.default.fileExists(atPath: urls.encoderURL.path) {
@@ -139,28 +132,16 @@ public extension StableDiffusionPipeline {
         }
 
         // Construct pipeline
-        if #available(macOS 14.0, iOS 17.0, *) {
-            self.init(
-                textEncoder: textEncoder,
-                unet: unet,
-                decoder: decoder,
-                encoder: encoder,
-                controlNet: controlNet,
-                safetyChecker: safetyChecker,
-                reduceMemory: reduceMemory,
-                useMultilingualTextEncoder: useMultilingualTextEncoder,
-                script: script
-            )
-        } else {
-            self.init(
-                textEncoder: textEncoder,
-                unet: unet,
-                decoder: decoder,
-                encoder: encoder,
-                controlNet: controlNet,
-                safetyChecker: safetyChecker,
-                reduceMemory: reduceMemory
-            )
-        }
+        self.init(
+            textEncoder: textEncoder,
+            unet: unet,
+            decoder: decoder,
+            encoder: encoder,
+            controlNet: controlNet,
+            safetyChecker: safetyChecker,
+            reduceMemory: reduceMemory,
+            useMultilingualTextEncoder: useMultilingualTextEncoder,
+            script: script
+        )
     }
 }

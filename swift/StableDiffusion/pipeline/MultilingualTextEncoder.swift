@@ -6,7 +6,6 @@ import NaturalLanguage
 import CoreML
 
 #if canImport(NaturalLanguage.NLContextualEmbedding)
-@available(iOS 17.0, macOS 14.0, *)
 public struct MultilingualTextEncoder: TextEncoderModel {
     let adapter: ManagedMLModel?
 
@@ -37,14 +36,14 @@ public struct MultilingualTextEncoder: TextEncoderModel {
     }
 
     /// Loads model resources into memory.
-    public func loadResources() throws {
-        try adapter?.loadResources()
+    public func loadResources() async throws {
+        try await adapter?.loadResources()
         try embeddingModel.load()
     }
 
     /// Unloads the model resources to free up memory.
-    public func unloadResources() {
-        adapter?.unloadResources()
+    public func unloadResources() async {
+        await adapter?.unloadResources()
         embeddingModel.unload()
     }
 
@@ -52,7 +51,7 @@ public struct MultilingualTextEncoder: TextEncoderModel {
     ///
     ///  - Parameter text: The input text.
     ///  - Returns: An embedding shaped array.
-    public func encode(_ text: String) throws -> MLShapedArray<Float> {
+    public func encode(_ text: String) async throws -> MLTensor {
         guard embeddingModel.hasAvailableAssets else {
             throw Error.missingEmbeddingResource
         }
@@ -78,19 +77,21 @@ public struct MultilingualTextEncoder: TextEncoderModel {
 
         if adapter == nil {
             // Return embeddings with shape [1, 256, 512].
-            return MLShapedArray(converting: shapedEmbeddings)
+            let output = MLShapedArray<Float>(converting: shapedEmbeddings)
+            return MLTensor(output)
         } else {
             // Project the embeddings to the correct CLIP model input shape of [1, 768, 1, 256].
-            return try projectEmbeddings(shapedEmbeddings)
+            let output = try await projectEmbeddings(shapedEmbeddings)
+            return MLTensor(output)
         }
     }
 
     /// Creates the adapter model input feature provider.
-    private func prepareProjectionInput(_ input: MLShapedArray<Double>) throws -> MLDictionaryFeatureProvider {
+    private func prepareProjectionInput(_ input: MLShapedArray<Double>) async throws -> MLDictionaryFeatureProvider {
         guard let adapter else {
             fatalError("Cannot prepare projection input without an adapter.")
         }
-        return try adapter.perform { model in
+        return try await adapter.perform { model in
             guard let inputDescription = model.modelDescription.inputDescriptionsByName.first?.value else {
                 throw Error.missingAdapterInput
             }
@@ -99,11 +100,11 @@ public struct MultilingualTextEncoder: TextEncoderModel {
     }
 
     /// Processes the adapter model output feature provider.
-    private func processProjectionOutput(_ output: MLFeatureProvider) throws -> MLShapedArray<Float> {
+    private func processProjectionOutput(_ output: MLFeatureProvider) async throws -> MLShapedArray<Float> {
         guard let adapter else {
             fatalError("Cannot process projection output without an adapter.")
         }
-        return try adapter.perform { model in
+        return try await adapter.perform { model in
             guard let outputDescription = model.modelDescription.outputDescriptionsByName.first?.value else {
                 throw Error.missingAdapterOutput
             }
@@ -122,19 +123,18 @@ public struct MultilingualTextEncoder: TextEncoderModel {
     }
 
     /// Projects the embeddings.
-    private func projectEmbeddings(_ embeddings: MLShapedArray<Double>) throws -> MLShapedArray<Float> {
+    private func projectEmbeddings(_ embeddings: MLShapedArray<Double>) async throws -> MLShapedArray<Float> {
         guard let adapter else {
             fatalError("Cannot project embeddings without an adapter.")
         }
-        let inputFeatureProvider = try prepareProjectionInput(embeddings)
-        let projection = try adapter.perform { model in
+        let inputFeatureProvider = try await prepareProjectionInput(embeddings)
+        let projection = try await adapter.perform { model in
             return try model.prediction(from: inputFeatureProvider)
         }
-        return try processProjectionOutput(projection)
+        return try await processProjectionOutput(projection)
     }
 }
 
-@available(iOS 17.0, macOS 14.0, *)
 extension MultilingualTextEncoder {
     /// A multilingual text encoder error.
     public enum Error: Swift.Error, LocalizedError, Equatable, CustomDebugStringConvertible {
@@ -177,12 +177,10 @@ extension MultilingualTextEncoder {
 }
 #endif
 
-@available(iOS 16.2, macOS 13.1, *)
 public enum Script: String {
     case latin, cyrillic, cjk
 
 #if canImport(NaturalLanguage.NLScript)
-    @available(iOS 17.0, macOS 14.0, *)
     var asNLScript: NLScript {
         switch self {
         case .latin: return .latin

@@ -5,7 +5,6 @@ import Foundation
 import CoreML
 import NaturalLanguage
 
-@available(iOS 17.0, macOS 14.0, *)
 public extension StableDiffusionXLPipeline {
 
     struct ResourceURLs {
@@ -46,14 +45,15 @@ public extension StableDiffusionXLPipeline {
     ///   - baseURL: URL pointing to directory holding all model and tokenization resources
     ///   - configuration: The configuration to load model resources with
     ///   - reduceMemory: Setup pipeline in reduced memory mode
+    ///   - unetFunctionName: The U-net function name to use.
     /// - Returns:
     ///  Pipeline ready for image generation if all  necessary resources loaded
     init(
         resourcesAt baseURL: URL,
         configuration config: MLModelConfiguration = .init(),
-        reduceMemory: Bool = false
+        reduceMemory: Bool = false,
+        unetFunctionName: String? = nil
     ) throws {
-
         /// Expect URL of each resource
         let urls = ResourceURLs(resourcesAt: baseURL)
         let tokenizer = try BPETokenizer(mergesAt: urls.mergesURL, vocabularyAt: urls.vocabURL)
@@ -63,7 +63,7 @@ public extension StableDiffusionXLPipeline {
         } else {
             textEncoder = nil
         }
-        
+
         // padToken is different in the second XL text encoder
         let tokenizer2 = try BPETokenizer(mergesAt: urls.mergesURL, vocabularyAt: urls.vocabURL, padToken: "!")
         let textEncoder2 = TextEncoderXL(tokenizer: tokenizer2, modelAt: urls.textEncoder2URL, configuration: config)
@@ -72,20 +72,34 @@ public extension StableDiffusionXLPipeline {
         let unet: Unet
         if FileManager.default.fileExists(atPath: urls.unetChunk1URL.path) &&
             FileManager.default.fileExists(atPath: urls.unetChunk2URL.path) {
-            unet = Unet(chunksAt: [urls.unetChunk1URL, urls.unetChunk2URL],
-                        configuration: config)
+            unet = Unet(
+                chunksAt: [urls.unetChunk1URL, urls.unetChunk2URL],
+                configuration: config,
+                functionName: unetFunctionName
+            )
         } else {
-            unet = Unet(modelAt: urls.unetURL, configuration: config)
+            unet = Unet(
+                modelAt: urls.unetURL,
+                configuration: config,
+                functionName: unetFunctionName
+            )
         }
 
         // Refiner Unet model
         let unetRefiner: Unet?
         if FileManager.default.fileExists(atPath: urls.unetRefinerChunk1URL.path) &&
             FileManager.default.fileExists(atPath: urls.unetRefinerChunk2URL.path) {
-            unetRefiner = Unet(chunksAt: [urls.unetRefinerChunk1URL, urls.unetRefinerChunk2URL],
-                               configuration: config)
+            unetRefiner = Unet(
+                chunksAt: [urls.unetRefinerChunk1URL, urls.unetRefinerChunk2URL],
+                configuration: config,
+                functionName: nil 
+            )
         } else if FileManager.default.fileExists(atPath: urls.unetRefinerURL.path) {
-            unetRefiner = Unet(modelAt: urls.unetRefinerURL, configuration: config)
+            unetRefiner = Unet(
+                modelAt: urls.unetRefinerURL,
+                configuration: config,
+                functionName: nil
+            )
         } else {
             unetRefiner = nil
         }

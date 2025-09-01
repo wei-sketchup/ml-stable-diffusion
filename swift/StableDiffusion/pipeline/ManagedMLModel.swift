@@ -7,9 +7,7 @@ import CoreML
 ///
 /// It will automatically load a model into memory when needed or requested
 /// It allows one to request to unload the model from memory
-@available(iOS 16.2, macOS 13.1, *)
-public final class ManagedMLModel: ResourceManaging {
-
+actor ManagedMLModel: ResourceManaging {
     /// The location of the model
     var modelURL: URL
 
@@ -18,9 +16,6 @@ public final class ManagedMLModel: ResourceManaging {
 
     /// The loaded model (when loaded)
     var loadedModel: MLModel?
-
-    /// Queue to protect access to loaded model
-    var queue: DispatchQueue
 
     /// Create a managed model given its location and desired loaded configuration
     ///
@@ -32,21 +27,16 @@ public final class ManagedMLModel: ResourceManaging {
         self.modelURL = url
         self.configuration = configuration
         self.loadedModel = nil
-        self.queue = DispatchQueue(label: "managed.\(url.lastPathComponent)")
     }
 
     /// Instantiation and load model into memory
-    public func loadResources() throws {
-        try queue.sync {
-            try loadModel()
-        }
+    public func loadResources() async throws {
+        try loadModel()
     }
 
     /// Unload the model if it was loaded
-    public func unloadResources() {
-        queue.sync {
-            loadedModel = nil
-        }
+    public func unloadResources() async {
+        loadedModel = nil
     }
 
     /// Perform an operation with the managed model via a supplied closure.
@@ -57,71 +47,106 @@ public final class ManagedMLModel: ResourceManaging {
     ///     - body: Closure which performs and action on a loaded model
     /// - Returns: The result of the closure
     /// - Throws: An error if the model cannot be loaded or if the closure throws
-    public func perform<R>(_ body: (MLModel) throws -> R) throws -> R {
-        return try queue.sync {
-            try autoreleasepool {
-                try loadModel()
-                return try body(loadedModel!)
-            }
+    public func perform<R>(_ body: (MLModel) async throws -> R) async throws -> R {
+        try autoreleasepool {
+            try loadModel()
         }
+        return try await body(loadedModel!)
     }
 
     private func loadModel() throws {
         if loadedModel == nil {
-            loadedModel = try MLModel(contentsOf: modelURL,
-                                      configuration: configuration)
+            loadedModel = try MLModel(contentsOf: modelURL, configuration: configuration)
         }
     }
 }
 
-@available(iOS 16.2, macOS 13.1, *)
-public extension Array where Element == ManagedMLModel {
-    /// Performs batch predictions using an array of `[ManagedMLModel]` instances in a pipeline.
-    /// - Parameter batch: Inputs for btached predictions.
-    /// - Returns: Final prediction results after processing through all models.
-    /// - Throws: Errors if the array is empty, predictions fail, or results can't be combined.
-    func predictions(from batch: MLBatchProvider) throws -> MLBatchProvider {
-        var results = try self.first!.perform { model in
-            try model.predictions(fromBatch: batch)
+extension ManagedMLModel {
+    /// Returns the shape for the input matching the given name.
+    ///
+    /// - Parameter name: The input name.
+    /// - Returns: The matching shape or `nil` if no match is found.
+    func shape(forInputNamed name: String) async throws -> [Int]? {
+        try await featureDescription(forInputNamed: name)?.multiArrayConstraint?.shape.map { $0.intValue }
+    }
+
+    /// Returns the description for the input matching the given name.
+    ///
+    /// - Parameter name: The input name.
+    /// - Returns: The matching description or `nil` if no match is found.
+    func featureDescription(forInputNamed name: String) async throws -> MLFeatureDescription? {
+        try await perform { model in
+            model.modelDescription.inputDescriptionsByName.first(where: { $0.key == name })?.value
         }
+    }
 
-        if self.count == 1 {
-            return results
+    /// Returns the first input feature description.
+    func firstInputFeatureDescription() async throws -> MLFeatureDescription? {
+        try await perform { model in
+            model.modelDescription.inputDescriptionsByName.first?.value
         }
+    }
 
-        // Manual pipeline batch prediction
-        let inputs = batch.arrayOfFeatureValueDictionaries
-        for stage in self.dropFirst() {
-            // Combine the original inputs with the outputs of the last stage
-            let next = try results.arrayOfFeatureValueDictionaries
-                .enumerated().map { index, dict in
-                    let nextDict = dict.merging(inputs[index]) { out, _ in out }
-                    return try MLDictionaryFeatureProvider(dictionary: nextDict)
-                }
-            let nextBatch = MLArrayBatchProvider(array: next)
+    /// Returns the name of the first input.
+    func firstInputName() async throws -> String? {
+        try await firstInputFeatureDescription()?.name
+    }
 
-            // Predict
-            results = try stage.perform { model in
-                try model.predictions(fromBatch: nextBatch)
+    /// Returns the shape of the first input.
+    func firstInputShape() async throws -> [Int]? {
+        try await firstInputFeatureDescription()?.multiArrayConstraint?.shape.map { $0.intValue }
+    }
+}
+
+extension Array where Element == ManagedMLModel {
+    /// Returns all shapes from the models whose inputs match the given name.
+    ///
+    /// - Parameter name: The input name.
+    /// - Returns: The matching shapes or `nil` if no match is found.
+    func shapes(forInputNamed name: String) async throws -> [[Int]]? {
+        let shapes = try await featureDescriptions(forInputNamed: name)?.compactMap { description in
+            description.multiArrayConstraint?.shape.map { $0.intValue }
+        }
+        guard let shapes, shapes.count == count else {
+            return nil
+        }
+        return shapes
+    }
+
+    /// Returns all descriptions from the models whose inputs match the given name.
+    ///
+    /// - Parameter name: The input name.
+    /// - Returns: The matching description or `nil` if no match is found.
+    func featureDescriptions(forInputNamed name: String) async throws -> [MLFeatureDescription]? {
+        var descriptions = [MLFeatureDescription]()
+        for model in self {
+            if let description = try await model.perform({ model in
+                model.modelDescription.inputDescriptionsByName.first(where: { $0.key == name })?.value
+            }) {
+                descriptions.append(description)
             }
         }
-
-        return results
-    }
-}
-
-extension MLFeatureProvider {
-    var featureValueDictionary: [String : MLFeatureValue] {
-        self.featureNames.reduce(into: [String : MLFeatureValue]()) { result, name in
-            result[name] = self.featureValue(for: name)
+        guard descriptions.count == count else {
+            return nil
         }
+        return descriptions
     }
-}
 
-extension MLBatchProvider {
-    var arrayOfFeatureValueDictionaries: [[String : MLFeatureValue]] {
-        (0..<self.count).map {
-            self.features(at: $0).featureValueDictionary
+    /// Returns the shape of the first model's input matching the given name.
+    ///
+    /// - Parameter name: The input name.
+    /// - Returns: The first matching shape or `nil` if no match is found.
+    func firstShape(forInputNamed name: String) async throws -> [Int]? {
+        try await firstFeatureDescription(forInputNamed: name)?.multiArrayConstraint?.shape.map { $0.intValue }
+    }
+
+    /// Returns the description of the first model's input matching the given name.
+    ///
+    /// - Parameter name: The input name.
+    /// - Returns: The first matching description or `nil` if no match is found.
+    func firstFeatureDescription(forInputNamed name: String) async throws -> MLFeatureDescription? {
+        try await first?.perform { model in
+            model.modelDescription.inputDescriptionsByName.first(where: { $0.key == name })?.value
         }
     }
 }

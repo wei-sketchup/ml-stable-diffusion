@@ -6,7 +6,6 @@ import CoreML
 ///  This implementation references to:
 ///  https://github.com/dsnz/random/blob/master/philox.py for Philox_M4_32 configuration.
 ///
-@available(iOS 16.2, macOS 13.1, *)
 struct NvRandomSource: RandomSource {
   public let seed: UInt64
   private var offset: UInt32
@@ -80,12 +79,15 @@ struct NvRandomSource: RandomSource {
 
   /// Generates a random value from a normal distribution with given mean and standard deviation.
   mutating func nextNormal(mean: Double = 0.0, stdev: Double = 1.0) -> Double {
-    return normalArray(count: 1, mean: mean, stdev: stdev)[0]
+      normalArray(count: 1, mean: mean, stdev: stdev)[0]
   }
 
-  /// Generate a shaped array with scalars from a normal distribution with given mean and standard deviation.
-  mutating func normalShapedArray(_ shape: [Int], mean: Double = 0.0, stdev: Double = 1.0) -> MLShapedArray<Double> {
-    let count = shape.reduce(1, *)
-    return .init(scalars: normalArray(count: count, mean: mean, stdev: stdev), shape: shape)
+  mutating func normalTensor(_ shape: [Int], mean: Float = 0.0, stdev: Float = 1.0) -> MLTensor {
+      let count = shape.reduce(1, *)
+      let fp64ShapedArray = MLShapedArray(
+        scalars: normalArray(count: count, mean: Double(mean), stdev: Double(stdev)),
+        shape: shape
+      )
+      return MLTensor(MLShapedArray<Float32>(converting: fp64ShapedArray))
   }
 }

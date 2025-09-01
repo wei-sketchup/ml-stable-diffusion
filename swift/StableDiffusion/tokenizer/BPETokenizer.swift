@@ -4,7 +4,6 @@
 import Foundation
 
 /// A tokenizer based on byte pair encoding.
-@available(iOS 16.2, macOS 13.1, *)
 public struct BPETokenizer {
     /// A dictionary that maps pairs of tokens to the rank/order of the merge.
     let merges: [TokenPair : Int]
@@ -169,7 +168,6 @@ public struct BPETokenizer {
     }
 }
 
-@available(iOS 16.2, macOS 13.1, *)
 extension BPETokenizer {
 
     /// A hashable tuple of strings

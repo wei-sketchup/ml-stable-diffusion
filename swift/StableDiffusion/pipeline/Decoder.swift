@@ -1,13 +1,11 @@
 // For licensing see accompanying LICENSE.md file.
-// Copyright (C) 2024 Apple Inc. All Rights Reserved.
+// Copyright (C) 2022 Apple Inc. All Rights Reserved.
 
 import Foundation
 import CoreML
 
 /// A decoder model which produces RGB images from latent samples
-@available(iOS 16.2, macOS 13.1, *)
 public struct Decoder: ResourceManaging {
-
     /// VAE decoder model
     var model: ManagedMLModel
 
@@ -18,17 +16,17 @@ public struct Decoder: ResourceManaging {
     ///     - configuration: configuration to be used when the model is loaded
     /// - Returns: A decoder that will lazily load its required resources when needed or requested
     public init(modelAt url: URL, configuration: MLModelConfiguration) {
-        self.model = ManagedMLModel(modelAt: url, configuration: configuration)
+        model = ManagedMLModel(modelAt: url, configuration: configuration)
     }
 
     /// Ensure the model has been loaded into memory
-    public func loadResources() throws {
-        try model.loadResources()
+    public func loadResources() async throws {
+        try await model.loadResources()
     }
 
     /// Unload the underlying model to free up memory
-    public func unloadResources() {
-        model.unloadResources()
+    public func unloadResources() async {
+       await model.unloadResources()
     }
 
     /// Batch decode latent samples into images
@@ -37,44 +35,30 @@ public struct Decoder: ResourceManaging {
     ///    - latents: Batch of latent samples to decode
     ///    - scaleFactor: scalar divisor on latents before decoding
     ///  - Returns: decoded images
-    public func decode(
-        _ latents: [MLShapedArray<Float32>],
-        scaleFactor: Float32,
-        shiftFactor: Float32 = 0.0
-    ) throws -> [CGImage] {
-
-        // Form batch inputs for model
-        let inputs: [MLFeatureProvider] = try latents.map { sample in
+    public func decode(_ latents: [MLTensor], scaleFactor: Float32) async throws -> [CGImage] {
+        guard let inputName = try await model.firstInputName() else {
+            fatalError("Failed to retrieve input name, \(#file) \(#line)")
+        }
+        var decodedLatents = [MLTensor]()
+        decodedLatents.reserveCapacity(latents.count)
+        for latent in latents {
             // Reference pipeline scales the latent samples before decoding
-            let sampleScaled = MLShapedArray<Float32>(
-                scalars: sample.scalars.map { $0 / scaleFactor + shiftFactor },
-                shape: sample.shape)
-
-            let dict = [inputName: MLMultiArray(sampleScaled)]
-            return try MLDictionaryFeatureProvider(dictionary: dict)
+            let scaledLatent = latent / scaleFactor
+            let outputs = try await model.perform { model in
+                try await model.prediction(from: [inputName: scaledLatent])
+            }
+            guard let output = outputs.values.first else {
+                fatalError("Missing output(s) \(#file) \(#line)")
+            }
+            decodedLatents.append(output)
         }
-        let batch = MLArrayBatchProvider(array: inputs)
-
-        // Batch predict with model
-        let results = try model.perform { model in
-            try model.predictions(fromBatch: batch)
-        }
-
         // Transform the outputs to CGImages
-        let images: [CGImage] = try (0..<results.count).map { i in
-            let result = results.features(at: i)
-            let outputName = result.featureNames.first!
-            let output = result.featureValue(for: outputName)!.multiArrayValue!
-            return try CGImage.fromShapedArray(MLShapedArray<Float32>(converting: output))
+        var images = [CGImage]()
+        images.reserveCapacity(decodedLatents.count)
+        for decodedLatent in decodedLatents {
+            let image = try await CGImage.fromTensor(decodedLatent)
+            images.append(image)
         }
-
         return images
     }
-
-    var inputName: String {
-        try! model.perform { model in
-            model.modelDescription.inputDescriptionsByName.first!.key
-        }
-    }
-
 }

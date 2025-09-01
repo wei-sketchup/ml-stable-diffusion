@@ -11,9 +11,7 @@ import Cocoa
 import CoreImage
 import NaturalLanguage
 
-@available(iOS 16.2, macOS 13.1, *)
-struct StableDiffusionSample: ParsableCommand {
-
+@main struct StableDiffusionSample: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Run stable diffusion to generate images guided by a text prompt",
         version: "0.1"
@@ -35,16 +33,13 @@ struct StableDiffusionSample: ParsableCommand {
         )
     )
     var resourcePath: String = "./"
-    
+
     @Flag(name: .customLong("xl"), help: "The resources correspond to a Stable Diffusion XL model")
     var isXL: Bool = false
 
-    @Flag(name: .customLong("sd3"), help: "The resources correspond to a Stable Diffusion 3 model")
-    var isSD3: Bool = false
-
     @Option(help: "Path to starting image.")
     var image: String? = nil
-    
+
     @Option(help: "Strength for image2image.")
     var strength: Float = 0.5
 
@@ -77,15 +72,15 @@ struct StableDiffusionSample: ParsableCommand {
     @Option(help: "Scheduler to use, one of {pndm, dpmpp}")
     var scheduler: SchedulerOption = .pndm
 
-    @Option(help: "Random number generator to use, one of {numpy, torch, nvidia}")
+    @Option(help: "Random number generator to use, one of {numpy, torch, nvidia, coreml}")
     var rng: RNGOption = .numpy
-    
+
     @Option(
         parsing: .upToNextOption,
         help: "ControlNet models used in image generation (enter file names in Resources/controlnet without extension)"
     )
     var controlnet: [String] = []
-    
+
     @Option(
         parsing: .upToNextOption,
         help: "image for each controlNet model (corresponding to the same order as --controlnet)"
@@ -104,73 +99,54 @@ struct StableDiffusionSample: ParsableCommand {
     @Option(help: "The natural language script for the multilingual contextual embedding")
     var script: Script = .latin
 
-    mutating func run() throws {
+    @Option(help: """
+        The U-net function name to use. The default function is used if no function name is \
+        specified.
+        """)
+    var unetFunctionName: String? = nil
+
+    mutating func run() async throws {
         guard FileManager.default.fileExists(atPath: resourcePath) else {
             throw RunError.resources("Resource path does not exist \(resourcePath)")
         }
 
         let config = MLModelConfiguration()
         config.computeUnits = computeUnits.asMLComputeUnits
+        config.allowLowPrecisionAccumulationOnGPU = true
         let resourceURL = URL(filePath: resourcePath)
 
         log("Loading resources and creating pipeline\n")
         log("(Note: This can take a while the first time using these resources)\n")
-        let pipeline: StableDiffusionPipelineProtocol
+        var pipeline: StableDiffusionPipelineProtocol
         var scaleFactor: Float32 = 0.18215
-        var shiftFactor: Float32 = 0.0
-        var timestepShift: Float32 = 1.0
-        if #available(macOS 14.0, iOS 17.0, *) {
-            if isXL {
-                scaleFactor = 0.13025
-                if !controlnet.isEmpty {
-                    throw RunError.unsupported("ControlNet is not supported for Stable Diffusion XL")
-                }
-                if useMultilingualTextEncoder {
-                    throw RunError.unsupported("Multilingual text encoder is not yet supported for Stable Diffusion XL")
-                }
-                pipeline = try StableDiffusionXLPipeline(
-                    resourcesAt: resourceURL,
-                    configuration: config,
-                    reduceMemory: reduceMemory
-                )
-            } else if isSD3 {
-                scaleFactor = 1.5305
-                shiftFactor = 0.0609
-                timestepShift = 3.0
-                if !controlnet.isEmpty {
-                    throw RunError.unsupported("ControlNet is not supported for Stable Diffusion 3")
-                }
-                if useMultilingualTextEncoder {
-                    throw RunError.unsupported("Multilingual text encoder is not yet supported for Stable Diffusion 3")
-                }
-                pipeline = try StableDiffusion3Pipeline(
-                    resourcesAt: resourceURL,
-                    configuration: config,
-                    reduceMemory: reduceMemory
-                )
-            } else {
-                pipeline = try StableDiffusionPipeline(
-                    resourcesAt: resourceURL,
-                    controlNet: controlnet,
-                    configuration: config,
-                    disableSafety: disableSafety,
-                    reduceMemory: reduceMemory,
-                    useMultilingualTextEncoder: useMultilingualTextEncoder,
-                    script: script
-                )
+        if isXL {
+            scaleFactor = 0.13025
+            if !controlnet.isEmpty {
+                throw RunError.unsupported("ControlNet is not supported for Stable Diffusion XL")
             }
-        } else  {
+            if useMultilingualTextEncoder {
+                throw RunError.unsupported("Multilingual text encoder is not yet supported for Stable Diffusion XL")
+            }
+            pipeline = try StableDiffusionXLPipeline(
+                resourcesAt: resourceURL,
+                configuration: config,
+                reduceMemory: reduceMemory,
+                unetFunctionName: unetFunctionName
+            )
+        } else {
             pipeline = try StableDiffusionPipeline(
                 resourcesAt: resourceURL,
                 controlNet: controlnet,
                 configuration: config,
                 disableSafety: disableSafety,
-                reduceMemory: reduceMemory
+                reduceMemory: reduceMemory,
+                useMultilingualTextEncoder: useMultilingualTextEncoder,
+                script: script
             )
         }
 
-        try pipeline.loadResources()
-        
+        try await pipeline.loadResources()
+
         let startingImage: CGImage?
         if let image {
             let imageURL = URL(filePath: image)
@@ -179,11 +155,10 @@ struct StableDiffusionSample: ParsableCommand {
             } catch let error {
                 throw RunError.resources("Starting image not found \(imageURL), error: \(error)")
             }
-            
         } else {
             startingImage = nil
         }
-        
+
         // convert image for ControlNet into CGImage when controlNet available
         let controlNetInputs: [CGImage]
         if !controlnet.isEmpty {
@@ -204,7 +179,7 @@ struct StableDiffusionSample: ParsableCommand {
         sampleTimer.start()
 
         var pipelineConfig = StableDiffusionPipeline.Configuration(prompt: prompt)
-        
+
         pipelineConfig.negativePrompt = negativePrompt
         pipelineConfig.startingImage = startingImage
         pipelineConfig.strength = strength
@@ -218,11 +193,10 @@ struct StableDiffusionSample: ParsableCommand {
         pipelineConfig.useDenoisedIntermediates = true
         pipelineConfig.encoderScaleFactor = scaleFactor
         pipelineConfig.decoderScaleFactor = scaleFactor
-        pipelineConfig.decoderShiftFactor = shiftFactor
-        pipelineConfig.schedulerTimestepShift = timestepShift
+        pipelineConfig.previewFrequency = saveEvery
 
-        let images = try pipeline.generateImages(
-            configuration: pipelineConfig) { progress in
+        let images = try await withMLTensorComputePolicy(.cpuOnly) {
+            try await pipeline.generateImages(configuration: pipelineConfig) { progress in
                 sampleTimer.stop()
                 handleProgress(progress,sampleTimer)
                 if progress.stepCount != progress.step {
@@ -230,10 +204,11 @@ struct StableDiffusionSample: ParsableCommand {
                 }
                 return true
             }
+        }
 
         _ = try saveImages(images, logNames: true)
     }
-    
+
     func convertImageToCGImage(imageURL: URL) throws -> CGImage {
         let imageData = try Data(contentsOf: imageURL)
         guard
@@ -258,8 +233,11 @@ struct StableDiffusionSample: ParsableCommand {
         log("] step/sec")
 
         if saveEvery > 0, progress.step % saveEvery == 0 {
-            let saveCount = (try? saveImages(progress.currentImages, step: progress.step)) ?? 0
-            log(" saved \(saveCount) image\(saveCount != 1 ? "s" : "")")
+            let currentImages = progress.currentImages.compactMap { $0 }
+            if !currentImages.isEmpty {
+                let saveCount = (try? saveImages(currentImages, step: progress.step)) ?? 0
+                log(" saved \(saveCount) image\(saveCount != 1 ? "s" : "")")
+            }
         }
         log("\n")
     }
@@ -304,7 +282,7 @@ struct StableDiffusionSample: ParsableCommand {
         if imageCount != 1 {
             name += ".\(sample)"
         }
-        
+
         if image != nil {
             name += ".str\(Int(strength * 100))"
         }
@@ -331,7 +309,6 @@ enum RunError: Error {
     case unsupported(String)
 }
 
-@available(iOS 16.2, macOS 13.1, *)
 enum ComputeUnits: String, ExpressibleByArgument, CaseIterable {
     case all, cpuAndGPU, cpuOnly, cpuAndNeuralEngine
     var asMLComputeUnits: MLComputeUnits {
@@ -344,7 +321,6 @@ enum ComputeUnits: String, ExpressibleByArgument, CaseIterable {
     }
 }
 
-@available(iOS 16.2, macOS 13.1, *)
 enum SchedulerOption: String, ExpressibleByArgument {
     case pndm, dpmpp
     var stableDiffusionScheduler: StableDiffusionScheduler {
@@ -355,23 +331,16 @@ enum SchedulerOption: String, ExpressibleByArgument {
     }
 }
 
-@available(iOS 16.2, macOS 13.1, *)
 enum RNGOption: String, ExpressibleByArgument {
-    case numpy, torch, nvidia
+    case numpy, torch, nvidia, coreml
     var stableDiffusionRNG: StableDiffusionRNG {
         switch self {
-        case .numpy: return .numpyRNG
-        case .torch: return .torchRNG
-        case .nvidia: return .nvidiaRNG
+        case .numpy: .numpyRNG
+        case .torch: .torchRNG
+        case .nvidia: .nvidiaRNG
+        case .coreml: .coreml
         }
     }
 }
 
-@available(iOS 16.2, macOS 13.1, *)
 extension Script: ExpressibleByArgument {}
-
-if #available(iOS 16.2, macOS 13.1, *) {
-    StableDiffusionSample.main()
-} else {
-    print("Unsupported OS")
-}

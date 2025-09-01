@@ -6,11 +6,10 @@ import CoreML
 import Accelerate
 
 /// Image safety checking model
-@available(iOS 16.2, macOS 13.1, *)
 public struct SafetyChecker: ResourceManaging {
 
     /// Safety checking Core ML model
-    var model: ManagedMLModel
+    let model: ManagedMLModel
 
     /// Creates safety checker
     ///
@@ -23,13 +22,13 @@ public struct SafetyChecker: ResourceManaging {
     }
 
     /// Ensure the model has been loaded into memory
-    public func loadResources() throws {
-        try model.loadResources()
+    public func loadResources() async throws {
+        try await model.loadResources()
     }
 
     /// Unload the underlying model to free up memory
-    public func unloadResources() {
-       model.unloadResources()
+    public func unloadResources() async {
+       await model.unloadResources()
     }
 
     typealias PixelBufferPFx1 = vImage.PixelBuffer<vImage.PlanarF>
@@ -52,13 +51,13 @@ public struct SafetyChecker: ResourceManaging {
     /// - Parameters:
     ///     - image: Image to check
     /// - Returns: Whether the model considers the image to be safe
-    public func isSafe(_ image: CGImage) throws -> Bool {
+    public func isSafe(_ image: CGImage) async throws -> Bool {
 
         let inputName = "clip_input"
         let adjustmentName = "adjustment"
         let imagesNames = "images"
 
-        let inputInfo = try model.perform { model in
+        let inputInfo = try await model.perform { model in
             model.modelDescription.inputDescriptionsByName
         }
         let inputShape = inputInfo[inputName]!.multiArrayConstraint!.shape
@@ -85,7 +84,7 @@ public struct SafetyChecker: ResourceManaging {
             throw SafetyCheckError.modelInputFailure
         }
 
-        let result = try model.perform { model in
+        let result = try await model.perform { model in
             try model.prediction(from: input)
         }
 
@@ -98,9 +97,7 @@ public struct SafetyChecker: ResourceManaging {
         return !unsafe
     }
 
-    func resizeToRGBA(_ image: CGImage,
-                      width: Int, height: Int) throws -> CGImage {
-
+    func resizeToRGBA(_ image: CGImage, width: Int, height: Int) throws -> CGImage {
         guard let context = CGContext(
             data: nil,
             width: width,

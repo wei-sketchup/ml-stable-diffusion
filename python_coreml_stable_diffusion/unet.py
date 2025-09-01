@@ -3,6 +3,7 @@
 # Copyright (C) 2022 Apple Inc. All Rights Reserved.
 #
 
+from typing import Any, List
 from python_coreml_stable_diffusion.layer_norm import LayerNormANE
 from python_coreml_stable_diffusion import attention
 
@@ -13,6 +14,7 @@ from enum import Enum
 
 import logging
 
+logger = logging.getLogger(__name__)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -42,23 +44,6 @@ WARN_MSG = \
     "This `nn.Module` is intended for Apple Silicon deployment only. " \
     "PyTorch-specific optimizations and training is disabled"
 
-class Einsum(nn.Module):
-    def __init__(self, heads, dim_head):
-        super().__init__()
-        self.heads = heads
-        self.dim_head = dim_head
-
-    def forward(self, q, k, v, mask):
-        if ATTENTION_IMPLEMENTATION_IN_EFFECT == AttentionImplementations.ORIGINAL:
-            return attention.original(q, k, v, mask, self.heads, self.dim_head)
-
-        elif ATTENTION_IMPLEMENTATION_IN_EFFECT == AttentionImplementations.SPLIT_EINSUM:
-            return attention.split_einsum(q, k, v, mask, self.heads, self.dim_head)
-
-        elif ATTENTION_IMPLEMENTATION_IN_EFFECT == AttentionImplementations.SPLIT_EINSUM_V2:
-            return attention.split_einsum_v2(q, k, v, mask, self.heads, self.dim_head)
-
-
 class CrossAttention(nn.Module):
     """ Apple Silicon friendly version of `diffusers.models.attention.CrossAttention`
     """
@@ -82,11 +67,10 @@ class CrossAttention(nn.Module):
                               bias=False)
         self.to_out = nn.Sequential(
             nn.Conv2d(inner_dim, query_dim, kernel_size=1, bias=True))
-        self.einsum = Einsum(self.heads, self.dim_head)
 
     def forward(self, hidden_states, context=None, mask=None):
-        # if self.training:
-        #     raise NotImplementedError(WARN_MSG)
+        if self.training:
+            raise NotImplementedError(WARN_MSG)
 
         batch_size, dim, _, sequence_length = hidden_states.shape
 
@@ -113,7 +97,17 @@ class CrossAttention(nn.Module):
                     f"Invalid shape for `mask` (Expected {expected_mask_shape}, got {list(mask.size())}"
                 )
 
-        attn = self.einsum(q, k, v, mask)
+        if ATTENTION_IMPLEMENTATION_IN_EFFECT == AttentionImplementations.ORIGINAL:
+            attn = attention.original(q, k, v, mask, self.heads, self.dim_head)
+
+        elif ATTENTION_IMPLEMENTATION_IN_EFFECT == AttentionImplementations.SPLIT_EINSUM:
+            attn = attention.split_einsum(q, k, v, mask, self.heads, self.dim_head)
+
+        elif ATTENTION_IMPLEMENTATION_IN_EFFECT == AttentionImplementations.SPLIT_EINSUM_V2:
+            attn = attention.split_einsum_v2(q, k, v, mask, self.heads, self.dim_head)
+
+        else:
+            raise ValueError(ATTENTION_IMPLEMENTATION_IN_EFFECT)
 
         return self.to_out(attn)
 
@@ -829,7 +823,6 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
         addition_embed_type=None,
         addition_time_embed_dim=None,
         projection_class_embeddings_input_dim=None,
-        support_controlnet=False,
         **kwargs,
     ):
         if kwargs.get("dual_cross_attention", None):
@@ -844,8 +837,6 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
         super().__init__()
         self._register_load_state_dict_pre_hook(linear_to_conv2d_map)
 
-        self.config.time_cond_proj_dim = None
-        self.support_controlnet = support_controlnet
         self.sample_size = sample_size
         time_embed_dim = block_out_channels[0] * 4
 
@@ -1006,7 +997,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
 
             down_block_res_samples += res_samples
 
-        if self.support_controlnet:
+        if additional_residuals:
             new_down_block_res_samples = ()
             for i, down_block_res_sample in enumerate(down_block_res_samples):
                 down_block_res_sample = down_block_res_sample + additional_residuals[i]
@@ -1018,7 +1009,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin):
                                 emb,
                                 encoder_hidden_states=encoder_hidden_states)
 
-        if self.support_controlnet:
+        if additional_residuals:
             sample = sample + additional_residuals[-1]
 
         # 5. up
@@ -1110,7 +1101,7 @@ class UNet2DConditionModelXL(UNet2DConditionModel):
 
             down_block_res_samples += res_samples
 
-        if self.support_controlnet:
+        if additional_residuals:
             new_down_block_res_samples = ()
             for i, down_block_res_sample in enumerate(down_block_res_samples):
                 down_block_res_sample = down_block_res_sample + additional_residuals[i]
@@ -1121,8 +1112,8 @@ class UNet2DConditionModelXL(UNet2DConditionModel):
         sample = self.mid_block(sample,
                                 emb,
                                 encoder_hidden_states=encoder_hidden_states)
-        
-        if self.support_controlnet:
+
+        if additional_residuals:
             sample = sample + additional_residuals[-1]
 
         # 5. up
@@ -1150,6 +1141,75 @@ class UNet2DConditionModelXL(UNet2DConditionModel):
         sample = self.conv_out(sample)
 
         return (sample, )
+
+
+class LoRAConv2d(torch.nn.Module):
+    """
+    LoRA implemented in a 2d convolutional layer
+
+    Reference: https://github.com/huggingface/peft/blob/d716adf31cc16d93c402b88e0c4e3892841741cb/src/peft/tuners/lora/layer.py#L347
+    """
+    def __init__(self, base_layer: torch.nn.Conv2d, lora_key: str, rank: int, lora_alpha: float, use_rslora: bool):
+        super().__init__()
+        self.base_layer = base_layer
+        in_channels, out_channels = base_layer.in_channels, base_layer.out_channels
+        self.lora_key = lora_key
+        # Replicating https://github.com/huggingface/peft/blob/d716adf31cc16d93c402b88e0c4e3892841741cb/src/peft/tuners/lora/layer.py#L46
+        # to ensure weights get mapped correctly.
+        self.lora_A = torch.nn.ModuleDict({})
+        self.lora_B = torch.nn.ModuleDict({})
+        self.lora_A[self.lora_key] = torch.nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=rank,
+            kernel_size=(1, 1),
+            stride=(1, 1),
+            bias=False,
+            dtype=base_layer.weight.dtype
+        )
+        self.lora_B[self.lora_key] = torch.nn.Conv2d(
+            in_channels=rank,
+            out_channels=out_channels,
+            kernel_size=(1, 1),
+            stride=(1, 1),
+            bias=False,
+            dtype=base_layer.weight.dtype
+        )
+        if use_rslora:
+            self.scaling = lora_alpha / math.sqrt(float(rank))
+        else:
+            self.scaling = lora_alpha / float(rank)
+
+    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        result = self.base_layer(x, *args, **kwargs)
+        torch_result_dtype = result.dtype
+        x = x.to(self.lora_A[self.lora_key].weight.dtype)
+        result = result + self.lora_B[self.lora_key](self.lora_A[self.lora_key](x)) * self.scaling
+        result = result.to(torch_result_dtype)
+        return result
+
+
+def attach_lora_weights(parent: torch.nn.Module, lora_key: str, peft_config: Any):
+    assert peft_config.peft_type == "LORA"
+    rank = peft_config.r
+    lora_alpha = peft_config.lora_alpha
+    use_rslora = peft_config.use_rslora
+    target_modules = set(peft_config.target_modules)
+
+    def _attach_lora_weights(parent: torch.nn.Module, name_path: List[str] = []):
+        for child_name, child in parent.named_children():
+            child_name_path = name_path + [child_name]
+            resolved_child_name_path = ".".join(child_name_path)
+            if resolved_child_name_path in target_modules:
+                lora_layer = LoRAConv2d(child, lora_key=lora_key, rank=rank, lora_alpha=lora_alpha, use_rslora=use_rslora)
+                setattr(parent, child_name, lora_layer)
+                target_modules.remove(resolved_child_name_path)
+            # DFS
+            _attach_lora_weights(child, child_name_path)
+
+    _attach_lora_weights(parent, [])
+
+    if len(target_modules) != 0:
+        logger.warning(f"`target_modules` is not empty! {target_modules}")
 
 
 def get_down_block(

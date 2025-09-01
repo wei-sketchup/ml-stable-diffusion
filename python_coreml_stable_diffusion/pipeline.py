@@ -416,10 +416,9 @@ class CoreMLStableDiffusionPipeline(DiffusionPipeline):
             callback=None,
             callback_steps=1,
             controlnet_cond=None,
-            original_size: Optional[Tuple[int, int]]=None,
-            crops_coords_top_left: Tuple[int, int]=(0, 0),
-            target_size: Optional[Tuple[int, int]]=None,
-            unet_batch_one=False,
+            original_size: Optional[Tuple[int, int]] = None,
+            crops_coords_top_left: Tuple[int, int] = (0, 0),
+            target_size: Optional[Tuple[int, int]] = None,
             **kwargs,
     ):
         # 1. Check inputs. Raise error if not correct
@@ -507,16 +506,11 @@ class CoreMLStableDiffusionPipeline(DiffusionPipeline):
             if isinstance(latent_model_input, torch.Tensor):
                 latent_model_input = latent_model_input.numpy()
 
-            if do_classifier_free_guidance:
-                timestep = np.array([t, t], np.float16)
-            else:
-                timestep = np.array([t,], np.float16)
-
             # controlnet
             if controlnet_cond:
                 control_net_additional_residuals = self.run_controlnet(
                     sample=latent_model_input,
-                    timestep=timestep,
+                    timestep=np.array([t, t]),
                     encoder_hidden_states=text_embeddings,
                     controlnet_cond=controlnet_cond,
                 )
@@ -526,38 +520,16 @@ class CoreMLStableDiffusionPipeline(DiffusionPipeline):
             # predict the noise residual
             unet_additional_kwargs.update(control_net_additional_residuals)
 
-            # get prediction from unet
-            if not (unet_batch_one and do_classifier_free_guidance):
-                noise_pred = self.unet(
-                    sample=latent_model_input.astype(np.float16),
-                    timestep=timestep,
-                    encoder_hidden_states=text_embeddings.astype(np.float16),
-                    **unet_additional_kwargs,
-                )["noise_pred"]
-
-                if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = np.split(noise_pred, 2)
-            else:
-                # query unet sequentially
-                latent_model_input = latent_model_input.astype(np.float16)
-                text_embeddings = text_embeddings.astype(np.float16)
-                timestep = np.array([t,], np.float16)
-
-                noise_pred_uncond = self.unet(
-                    sample=np.expand_dims(latent_model_input[0], axis=0),
-                    timestep=timestep,
-                    encoder_hidden_states=np.expand_dims(text_embeddings[0], axis=0),
-                    **unet_additional_kwargs,
-                )["noise_pred"]
-                noise_pred_text = self.unet(
-                    sample=np.expand_dims(latent_model_input[1], axis=0),
-                    timestep=timestep,
-                    encoder_hidden_states=np.expand_dims(text_embeddings[1], axis=0),
-                    **unet_additional_kwargs,
-                )["noise_pred"]
+            noise_pred = self.unet(
+                sample=latent_model_input.astype(np.float16),
+                timestep=np.array([t, t], np.float16),
+                encoder_hidden_states=text_embeddings.astype(np.float16),
+                **unet_additional_kwargs,
+            )["noise_pred"]
 
             # perform guidance
             if do_classifier_free_guidance:
+                noise_pred_uncond, noise_pred_text = np.split(noise_pred, 2)
                 noise_pred = noise_pred_uncond + guidance_scale * (
                         noise_pred_text - noise_pred_uncond)
 
@@ -632,7 +604,8 @@ def get_coreml_pipe(pytorch_pipe,
             "tokenizer": pytorch_pipe.tokenizer,
             'tokenizer_2': pytorch_pipe.tokenizer_2,
             "scheduler": pytorch_pipe.scheduler if scheduler_override is None else scheduler_override,
-            'xl': True,
+            "force_zeros_for_empty_prompt": force_zeros_for_empty_prompt,
+            'xl': True
         }
 
         model_packages_to_load = ["text_encoder", "text_encoder_2", "unet", "vae_decoder"]
@@ -644,8 +617,6 @@ def get_coreml_pipe(pytorch_pipe,
             "feature_extractor": pytorch_pipe.feature_extractor,
         }
         model_packages_to_load = ["text_encoder", "unet", "vae_decoder"]
-
-    coreml_pipe_kwargs["force_zeros_for_empty_prompt"] = force_zeros_for_empty_prompt
 
     if getattr(pytorch_pipe, "safety_checker", None) is not None:
         model_packages_to_load.append("safety_checker")
@@ -742,7 +713,7 @@ def main(args):
 
     # Get Force Zeros Config if it exists
     force_zeros_for_empty_prompt: bool = False
-    if 'xl' in args.model_version and 'force_zeros_for_empty_prompt' in pytorch_pipe.config:
+    if 'force_zeros_for_empty_prompt' in pytorch_pipe.config:
         force_zeros_for_empty_prompt = pytorch_pipe.config['force_zeros_for_empty_prompt']
 
     coreml_pipe = get_coreml_pipe(
@@ -774,7 +745,6 @@ def main(args):
         guidance_scale=args.guidance_scale,
         controlnet_cond=controlnet_cond,
         negative_prompt=args.negative_prompt,
-        unet_batch_one=args.unet_batch_one,
     )
 
     out_path = get_image_path(args)
@@ -845,10 +815,6 @@ if __name__ == "__main__":
         "--negative-prompt",
         default=None,
         help="The negative text prompt to be used for text-to-image generation.")
-    parser.add_argument(
-        "--unet-batch-one",
-        action="store_true",
-        help="Do not batch unet predictions for the prompt and negative prompt.")
     parser.add_argument('--model-sources',
                         default=None,
                         choices=['packages', 'compiled'],

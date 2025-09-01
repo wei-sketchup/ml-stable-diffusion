@@ -8,12 +8,10 @@ import CoreGraphics
 public enum PipelineMode {
     case textToImage
     case imageToImage
-    // case inPainting
 }
 
 /// Image generation configuration
 public struct PipelineConfiguration: Hashable {
-    
     /// Text prompt to guide sampling
     public var prompt: String
     /// Negative text prompt to guide sampling
@@ -38,6 +36,8 @@ public struct PipelineConfiguration: Hashable {
     public var guidanceScale: Float = 7.5
     /// List of Images for available ControlNet Models
     public var controlNetInputs: [CGImage] = []
+    /// List of weights for outputs prodcued by the ControlNets
+    public var controlNetWeights: [Float16] = []
     /// Safety checks are only performed if `self.canSafetyCheck && !disableSafety`
     public var disableSafety: Bool = false
     /// Enables progress updates to decode `currentImages` from denoised latent images for better previews
@@ -46,16 +46,12 @@ public struct PipelineConfiguration: Hashable {
     public var schedulerType: StableDiffusionScheduler = .pndmScheduler
     /// The spacing to use for scheduler sigmas and time steps. Only supported when using `.dpmppScheduler`.
     public var schedulerTimestepSpacing: TimeStepSpacing = .linspace
-    /// Resolution dependent shifting of timestep schedules
-    public var schedulerTimestepShift: Float = 3.0
     /// The type of RNG to use
     public var rngType: StableDiffusionRNG = .numpyRNG
     /// Scale factor to use on the latent after encoding
     public var encoderScaleFactor: Float32 = 0.18215
     /// Scale factor to use on the latent before decoding
     public var decoderScaleFactor: Float32 = 0.18215
-    /// Shift factor to use on the latent before decoding
-    public var decoderShiftFactor: Float32 = 0.0
     /// If `originalSize` is not the same as `targetSize` the image will appear to be down- or upsampled.
     /// Part of SDXL’s micro-conditioning as explained in section 2.2 of https://huggingface.co/papers/2307.01952.
     public var originalSize: Float32 = 1024
@@ -68,6 +64,10 @@ public struct PipelineConfiguration: Hashable {
     public var aestheticScore: Float32 = 6
     /// Can be used to simulate an aesthetic score of the generated image by influencing the negative text condition.
     public var negativeAestheticScore: Float32 = 2.5
+    /// The frequency images are generated and returned during diffusion, i.e., images will be returned every fifth
+    /// step if `previewFrequency` is set to `5`. Set to `<= 0` to disable preview images being generated.
+    /// - Note: Generating preview images will impact overall inference time.
+    public var previewFrequency: Int = 5
 
     /// Given the configuration, what mode will be used for generation
     public var mode: PipelineMode {
@@ -80,18 +80,14 @@ public struct PipelineConfiguration: Hashable {
         return .imageToImage
     }
 
-    public init(
-        prompt: String
-    ) {
+    public init(prompt: String) {
         self.prompt = prompt
     }
 
 }
 
 
-@available(iOS 16.2, macOS 13.1, *)
 public extension StableDiffusionPipeline {
-
     /// Type of processing that will be performed to generate an image
     typealias Mode = PipelineMode
 

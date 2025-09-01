@@ -5,79 +5,90 @@ import Foundation
 import CoreML
 
 /// U-Net noise prediction model for stable diffusion
-@available(iOS 16.2, macOS 13.1, *)
 public struct Unet: ResourceManaging {
 
     /// Model used to predict noise residuals given an input, diffusion time step, and conditional embedding
     ///
     /// It can be in the form of a single model or multiple stages
-    var models: [ManagedMLModel]
+    let models: [ManagedMLModel]
 
     /// Creates a U-Net noise prediction model
     ///
     /// - Parameters:
-    ///   - url: Location of single U-Net  compiled Core ML model
-    ///   - configuration: Configuration to be used when the model is loaded
+    ///   - url: Location of single U-Net  compiled Core ML model.
+    ///   - configuration: Configuration to be used when the model is loaded.
+    ///   - functionName: The function name the U-net model will use. The default function is used if no
+    ///     function name is specified.
     /// - Returns: U-net model that will lazily load its required resources when needed or requested
-    public init(modelAt url: URL,
-                configuration: MLModelConfiguration) {
-        self.models = [ManagedMLModel(modelAt: url, configuration: configuration)]
+    public init(
+        modelAt url: URL,
+        configuration: MLModelConfiguration,
+        functionName: String? = nil
+    ) {
+        var configuration = configuration
+        if let functionName {
+            configuration = configuration.copy() as! MLModelConfiguration
+            configuration.functionName = functionName
+        }
+        models = [ManagedMLModel(modelAt: url, configuration: configuration)]
     }
 
     /// Creates a U-Net noise prediction model
     ///
     /// - Parameters:
-    ///   - urls: Location of chunked U-Net via urls to each compiled chunk
-    ///   - configuration: Configuration to be used when the model is loaded
+    ///   - urls: Location of chunked U-Net via urls to each compiled chunk.
+    ///   - configuration: Configuration to be used when the model is loaded.
+    ///   - functionName: The function name the U-net model will use. The default function is used if no
+    ///     function name is specified.
     /// - Returns: U-net model that will lazily load its required resources when needed or requested
-    public init(chunksAt urls: [URL],
-                configuration: MLModelConfiguration) {
+    public init(
+        chunksAt urls: [URL],
+        configuration: MLModelConfiguration,
+        functionName: String? = nil
+    ) {
+        var configuration = configuration
+        if let functionName {
+            configuration = configuration.copy() as! MLModelConfiguration
+            configuration.functionName = functionName
+        }
         self.models = urls.map { ManagedMLModel(modelAt: $0, configuration: configuration) }
     }
 
     /// Load resources.
-    public func loadResources() throws {
-        for model in models {
-            try model.loadResources()
-        }
+    public func loadResources() async throws {
+        try await models.loadResources()
     }
 
     /// Unload the underlying model to free up memory
-    public func unloadResources() {
-        for model in models {
-            model.unloadResources()
-        }
+    public func unloadResources() async {
+        await models.unloadResources()
     }
 
     /// Pre-warm resources
-    public func prewarmResources() throws {
+    public func prewarmResources() async throws {
         // Override default to pre-warm each model
-        for model in models {
-            try model.loadResources()
-            model.unloadResources()
-        }
-    }
-
-    var latentSampleDescription: MLFeatureDescription {
-        try! models.first!.perform { model in
-            model.modelDescription.inputDescriptionsByName["sample"]!
-        }
+        // TODO: Verify that this is called.
+        try await models.prewarmResources()
     }
 
     /// The expected shape of the models latent sample input
     public var latentSampleShape: [Int] {
-        latentSampleDescription.multiArrayConstraint!.shape.map { $0.intValue }
-    }
-
-    var latentTimeIdDescription: MLFeatureDescription {
-        try! models.first!.perform { model in
-            model.modelDescription.inputDescriptionsByName["time_ids"]!
+        get async {
+            guard let shape = try? await models.firstShape(forInputNamed: InputNames.sample) else {
+                fatalError("Failed to get input shape for input named `\(InputNames.sample)`.")
+            }
+            return shape
         }
     }
 
     /// The expected shape of the geometry conditioning
     public var latentTimeIdShape: [Int] {
-        latentTimeIdDescription.multiArrayConstraint!.shape.map { $0.intValue }
+        get async {
+            guard let shape = try? await models.firstShape(forInputNamed: InputNames.timeIds) else {
+                fatalError("Failed to get input shape for input named `\(InputNames.timeIds)`.")
+            }
+            return shape
+        }
     }
 
     /// Batch prediction noise from latent samples
@@ -88,58 +99,34 @@ public struct Unet: ResourceManaging {
     ///   - hiddenStates: Hidden state to condition on
     /// - Returns: Array of predicted noise residuals
     func predictNoise(
-        latents: [MLShapedArray<Float32>],
+        latents: [MLTensor],
         timeStep: Int,
-        hiddenStates: MLShapedArray<Float32>,
-        additionalResiduals: [[String: MLShapedArray<Float32>]]? = nil
-    ) throws -> [MLShapedArray<Float32>] {
-
+        hiddenStates: MLTensor,
+        additionalResiduals: [[String: MLTensor]]? = nil
+    ) async throws -> [MLTensor] {
         // Match time step batch dimension to the model / latent samples
-        let t: MLShapedArray<Float32>
-        if hiddenStates.shape[0] == 2 {
-            t = MLShapedArray(scalars: [Float(timeStep), Float(timeStep)], shape: [2])
-        } else {
-            t = MLShapedArray(scalars: [Float(timeStep)], shape: [1])
-        }
+        let t = MLTensor(shape: [2], scalars:[Float(timeStep), Float(timeStep)])
 
-        // Form batch input to model
-        let inputs = try latents.enumerated().map {
-            var dict: [String: Any] = [
-                "sample" : MLMultiArray($0.element),
-                "timestep" : MLMultiArray(t),
-                "encoder_hidden_states": MLMultiArray(hiddenStates)
+        // Dispatch all inputs and return the results.
+        var noise = [MLTensor]()
+        for (index, latent) in latents.enumerated() {
+            var inputs = [
+                InputNames.sample : latent,
+                InputNames.timestep : t,
+                InputNames.encoderHiddenStates: hiddenStates
             ]
-            if let residuals = additionalResiduals?[$0.offset] {
+            if let residuals = additionalResiduals?[index] {
                 for (k, v) in residuals {
-                    dict[k] = MLMultiArray(v)
+                    inputs[k] = v
                 }
             }
-            return try MLDictionaryFeatureProvider(dictionary: dict)
+            // Make predictions
+            let outputs = try await predictions(from: inputs)
+            guard let result = outputs.values.first else {
+                fatalError("Missing output(s) \(#file) \(#line)")
+            }
+            noise.append(result.cast(to: Float.self))
         }
-        let batch = MLArrayBatchProvider(array: inputs)
-
-        // Make predictions
-        let results = try models.predictions(from: batch)
-
-        // Pull out the results in Float32 format
-        let noise = (0..<results.count).map { i in
-
-            let result = results.features(at: i)
-            let outputName = result.featureNames.first!
-
-            let outputNoise = result.featureValue(for: outputName)!.multiArrayValue!
-
-            // To conform to this func return type make sure we return float32
-            // Use the fact that the concatenating constructor for MLMultiArray
-            // can do type conversion:
-            let fp32Noise = MLMultiArray(
-                concatenating: [outputNoise],
-                axis: 0,
-                dataType: .float32
-            )
-            return MLShapedArray<Float32>(fp32Noise)
-        }
-
         return noise
     }
 
@@ -152,53 +139,61 @@ public struct Unet: ResourceManaging {
     ///   - pooledStates: Additional text states to condition on
     ///   - geometryConditioning: Condition on image geometry
     /// - Returns: Array of predicted noise residuals
-    @available(iOS 17.0, macOS 14.0, *)
     func predictNoise(
-        latents: [MLShapedArray<Float32>],
+        latents: [MLTensor],
         timeStep: Int,
-        hiddenStates: MLShapedArray<Float32>,
-        pooledStates: MLShapedArray<Float32>,
-        geometryConditioning: MLShapedArray<Float32>
-    ) throws -> [MLShapedArray<Float32>] {
-
+        hiddenStates: MLTensor,
+        pooledStates: MLTensor,
+        geometryConditioning: MLTensor
+    ) async throws -> [MLTensor] {
         // Match time step batch dimension to the model / latent samples
-        let t = MLShapedArray<Float32>(scalars:[Float(timeStep), Float(timeStep)],shape:[2])
+        let t = MLTensor(shape: [2], scalars: [Float(timeStep), Float(timeStep)])
 
-        // Form batch input to model
-        let inputs = try latents.enumerated().map {
-            let dict: [String: Any] = [
-                "sample" : MLMultiArray($0.element),
-                "timestep" : MLMultiArray(t),
-                "encoder_hidden_states": MLMultiArray(hiddenStates),
-                "text_embeds": MLMultiArray(pooledStates),
-                "time_ids": MLMultiArray(geometryConditioning)
+        // Dispatch all inputs and return the results.
+        var noise = [MLTensor]()
+        for latent in latents {
+            let inputs = [
+                InputNames.sample : latent,
+                InputNames.timestep : t,
+                InputNames.encoderHiddenStates: hiddenStates,
+                InputNames.textEmbeddings: pooledStates,
+                InputNames.timeIds: geometryConditioning
             ]
-            return try MLDictionaryFeatureProvider(dictionary: dict)
+            // Make predictions
+            let outputs = try await predictions(from: inputs)
+            guard let result = outputs.values.first else {
+                fatalError("Missing output(s) \(#file) \(#line)")
+            }
+            noise.append(result.cast(to: Float.self))
         }
-        let batch = MLArrayBatchProvider(array: inputs)
-
-        // Make predictions
-        let results = try models.predictions(from: batch)
-
-        // Pull out the results in Float32 format
-        let noise = (0..<results.count).map { i in
-
-            let result = results.features(at: i)
-            let outputName = result.featureNames.first!
-
-            let outputNoise = result.featureValue(for: outputName)!.multiArrayValue!
-
-            // To conform to this func return type make sure we return float32
-            // Use the fact that the concatenating constructor for MLMultiArray
-            // can do type conversion:
-            let fp32Noise = MLMultiArray(
-                concatenating: [outputNoise],
-                axis: 0,
-                dataType: .float32
-            )
-            return MLShapedArray<Float32>(fp32Noise)
-        }
-
         return noise
+    }
+
+    func predictions(from inputs: [String: MLTensor]) async throws -> [String: MLTensor] {
+        var results = try await models.first!.perform { model in
+            try await model.prediction(from: inputs)
+        }
+        guard models.count > 1 else {
+            return results
+        }
+        // Manual pipeline batch prediction
+        for stage in models.dropFirst() {
+            // Combine the original inputs with the outputs of the last stage
+            let next = results.merging(inputs) { out, _ in out }
+            results = try await stage.perform { model in
+                try await model.prediction(from: next)
+            }
+        }
+        return results
+    }
+}
+
+extension Unet {
+    enum InputNames {
+        static let sample = "sample"
+        static let timestep = "timestep"
+        static let encoderHiddenStates = "encoder_hidden_states"
+        static let textEmbeddings = "text_embeds"
+        static let timeIds = "time_ids"
     }
 }
