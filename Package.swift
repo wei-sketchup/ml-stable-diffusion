@@ -6,13 +6,13 @@ import PackageDescription
 let package = Package(
     name: "stable-diffusion",
     platforms: [
-        .macOS("15.0.internal"),
-        .iOS("18.0.internal"),
+        .macOS("15.0"),
+        .iOS("18.0"),
     ],
     products: [
         .library(
-            name: "StableDiffusion",
-            targets: ["StableDiffusion"]),
+            name: "StableDiffusionLib",
+            targets: ["StableDiffusionLib"]),
         .executable(
             name: "StableDiffusionSample",
             targets: ["StableDiffusionCLI"]),
@@ -25,25 +25,25 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "StableDiffusion",
+            name: "StableDiffusionLib",
             dependencies: [],
             path: "swift/StableDiffusion"),
         .executableTarget(
             name: "StableDiffusionCLI",
             dependencies: [
-                "StableDiffusion",
+                "StableDiffusionLib",
                 .product(name: "ArgumentParser", package: "swift-argument-parser")],
             path: "swift/StableDiffusionCLI"),
         .executableTarget(
             name: "StableDiffusionRunner",
             dependencies: [
-                "StableDiffusion",
+                "StableDiffusionLib",
                 .product(name: "ArgumentParser", package: "swift-argument-parser")
             ],
             path: "swift/StableDiffusionRunner"),
         .testTarget(
             name: "StableDiffusionTests",
-            dependencies: ["StableDiffusion"],
+            dependencies: ["StableDiffusionLib"],
             path: "swift/StableDiffusionTests",
             resources: [
                 .copy("Resources/vocab.json"),

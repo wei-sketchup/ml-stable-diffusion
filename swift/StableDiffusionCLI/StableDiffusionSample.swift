@@ -5,7 +5,7 @@ import ArgumentParser
 import CoreGraphics
 import CoreML
 import Foundation
-import StableDiffusion
+import StableDiffusionLib
 import UniformTypeIdentifiers
 import Cocoa
 import CoreImage

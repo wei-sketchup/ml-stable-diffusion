@@ -485,7 +485,7 @@ Please use the `--help` flag to learn about batched generation and more.
 ### Example Library Usage
 
 ```swift
-import StableDiffusion
+import StableDiffusionLib
 ...
 let pipeline = try StableDiffusionPipeline(resourcesAt: resourceURL)
 pipeline.loadResources()

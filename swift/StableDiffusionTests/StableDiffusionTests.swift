@@ -3,7 +3,7 @@
 
 import XCTest
 import CoreML
-@testable import StableDiffusion
+@testable import StableDiffusionLib
 
 final class StableDiffusionTests: XCTestCase {
 
